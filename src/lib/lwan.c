@@ -393,6 +393,21 @@ void lwan_set_url_map(struct lwan *l, const struct lwan_url_map *map)
     }
 }
 
+void lwan_add_url_map(struct lwan *l, const struct lwan_url_map *map)
+{
+    for (; map->prefix; map++) {
+        struct lwan_url_map *copy = add_url_map(&l->url_map_trie, NULL, map);
+
+        if (copy->module && copy->module->create) {
+            copy->data = copy->module->create (map->prefix, copy->args);
+            copy->flags = copy->module->flags;
+            copy->handler = copy->module->handle_request;
+        } else {
+            copy->flags = HANDLER_PARSE_MASK;
+        }
+    }
+}
+
 static void parse_listener(struct config *c,
                            const struct config_line *l,
                            struct lwan *lwan)

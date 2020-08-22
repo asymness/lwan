@@ -356,7 +356,7 @@ size_t lwan_prepare_response_header_full(
             "\r\nAccess-Control-Allow-Origin: *"
             "\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS"
             "\r\nAccess-Control-Allow-Credentials: true"
-            "\r\nAccess-Control-Allow-Headers: Origin, Accept, Content-Type");
+            "\r\nAccess-Control-Allow-Headers: Origin, Accept, Content-Type, Authorization");
     }
 
     APPEND_STRING_LEN(lwan_strbuf_get_buffer(request->global_response_headers),

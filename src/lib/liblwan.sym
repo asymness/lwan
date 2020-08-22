@@ -33,6 +33,7 @@ global:
     lwan_prepare_response_header_full;
 
     lwan_set_url_map;
+    lwan_add_url_map;
 
     lwan_status_critical;
     lwan_status_critical_perror;
