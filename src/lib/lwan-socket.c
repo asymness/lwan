@@ -23,6 +23,7 @@
 #include <fcntl.h>
 #include <netdb.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
@@ -35,10 +36,38 @@
 #include "int-to-str.h"
 #include "sd-daemon.h"
 
-int lwan_socket_get_backlog_size(void)
-{
-    int backlog = SOMAXCONN;
+#ifdef __linux__
 
+static bool reno_supported;
+static void init_reno_supported(void)
+{
+    FILE *allowed;
+
+    reno_supported = false;
+
+    allowed = fopen("/proc/sys/net/ipv4/tcp_allowed_congestion_control", "re");
+    if (!allowed)
+        return;
+
+    char line[4096];
+    if (fgets(line, sizeof(line), allowed)) {
+        if (strstr(line, "reno"))
+            reno_supported = true;
+    }
+    fclose(allowed);
+}
+
+static bool is_reno_supported(void)
+{
+    static pthread_once_t reno_supported_once = PTHREAD_ONCE_INIT;
+    pthread_once(&reno_supported_once, init_reno_supported);
+    return reno_supported;
+}
+#endif
+
+static int backlog_size;
+static void init_backlog_size(void)
+{
 #ifdef __linux__
     FILE *somaxconn;
 
@@ -46,12 +75,20 @@ int lwan_socket_get_backlog_size(void)
     if (somaxconn) {
         int tmp;
         if (fscanf(somaxconn, "%d", &tmp) == 1)
-            backlog = tmp;
+            backlog_size = tmp;
         fclose(somaxconn);
     }
 #endif
 
-    return backlog;
+    if (!backlog_size)
+        backlog_size = SOMAXCONN;
+}
+
+int lwan_socket_get_backlog_size(void)
+{
+    static pthread_once_t backlog_size_once = PTHREAD_ONCE_INIT;
+    pthread_once(&backlog_size_once, init_backlog_size);
+    return backlog_size;
 }
 
 static int set_socket_flags(int fd)
@@ -150,22 +187,25 @@ static sa_family_t parse_listener(char *listener, char **node, char **port)
     return parse_listener_ipv4(listener, node, port);
 }
 
-static int listen_addrinfo(int fd, const struct addrinfo *addr)
+static int
+listen_addrinfo(int fd, const struct addrinfo *addr, bool print_listening_msg)
 {
     if (listen(fd, lwan_socket_get_backlog_size()) < 0)
         lwan_status_critical_perror("listen");
 
-    char host_buf[NI_MAXHOST], serv_buf[NI_MAXSERV];
-    int ret = getnameinfo(addr->ai_addr, addr->ai_addrlen, host_buf,
-                          sizeof(host_buf), serv_buf, sizeof(serv_buf),
-                          NI_NUMERICHOST | NI_NUMERICSERV);
-    if (ret)
-        lwan_status_critical("getnameinfo: %s", gai_strerror(ret));
+    if (print_listening_msg) {
+        char host_buf[NI_MAXHOST], serv_buf[NI_MAXSERV];
+        int ret = getnameinfo(addr->ai_addr, addr->ai_addrlen, host_buf,
+                              sizeof(host_buf), serv_buf, sizeof(serv_buf),
+                              NI_NUMERICHOST | NI_NUMERICSERV);
+        if (ret)
+            lwan_status_critical("getnameinfo: %s", gai_strerror(ret));
 
-    if (addr->ai_family == AF_INET6)
-        lwan_status_info("Listening on http://[%s]:%s", host_buf, serv_buf);
-    else
-        lwan_status_info("Listening on http://%s:%s", host_buf, serv_buf);
+        if (addr->ai_family == AF_INET6)
+            lwan_status_info("Listening on http://[%s]:%s", host_buf, serv_buf);
+        else
+            lwan_status_info("Listening on http://%s:%s", host_buf, serv_buf);
+    }
 
     return set_socket_flags(fd);
 }
@@ -181,10 +221,10 @@ static int listen_addrinfo(int fd, const struct addrinfo *addr)
     do {                                                                       \
         const socklen_t _param_size_ = (socklen_t)sizeof(*(_param));           \
         if (setsockopt(fd, (_domain), (_option), (_param), _param_size_) < 0)  \
-            lwan_status_warning("%s not supported by the kernel", #_option);   \
+            lwan_status_perror("%s not supported by the kernel", #_option);    \
     } while (0)
 
-static int bind_and_listen_addrinfos(struct addrinfo *addrs, bool reuse_port)
+static int bind_and_listen_addrinfos(const struct addrinfo *addrs, bool print_listening_msg)
 {
     const struct addrinfo *addr;
 
@@ -198,15 +238,13 @@ static int bind_and_listen_addrinfos(struct addrinfo *addrs, bool reuse_port)
 
         SET_SOCKET_OPTION(SOL_SOCKET, SO_REUSEADDR, (int[]){1});
 #ifdef SO_REUSEPORT
-        SET_SOCKET_OPTION_MAY_FAIL(SOL_SOCKET, SO_REUSEPORT,
-                                   (int[]){reuse_port});
+        SET_SOCKET_OPTION(SOL_SOCKET, SO_REUSEPORT, (int[]){1});
 #else
-        if (reuse_port)
-            lwan_status_warning("reuse_port not supported by the OS");
+        lwan_status_critical("SO_REUSEPORT not supported by the OS");
 #endif
 
         if (!bind(fd, addr->ai_addr, addr->ai_addrlen))
-            return listen_addrinfo(fd, addr);
+            return listen_addrinfo(fd, addr, print_listening_msg);
 
         close(fd);
     }
@@ -214,11 +252,12 @@ static int bind_and_listen_addrinfos(struct addrinfo *addrs, bool reuse_port)
     lwan_status_critical("Could not bind socket");
 }
 
-static int setup_socket_normally(struct lwan *l)
+static int setup_socket_normally(struct lwan *l, bool print_listening_msg)
 {
     char *node, *port;
     char *listener = strdupa(l->config.listener);
     sa_family_t family = parse_listener(listener, &node, &port);
+
     if (family == AF_MAX) {
         lwan_status_critical("Could not parse listener: %s",
                              l->config.listener);
@@ -233,16 +272,14 @@ static int setup_socket_normally(struct lwan *l)
     if (ret)
         lwan_status_critical("getaddrinfo: %s", gai_strerror(ret));
 
-    int fd = bind_and_listen_addrinfos(addrs, l->config.reuse_port);
+    int fd = bind_and_listen_addrinfos(addrs, print_listening_msg);
     freeaddrinfo(addrs);
     return fd;
 }
 
-void lwan_socket_init(struct lwan *l)
+int lwan_create_listen_socket(struct lwan *l, bool print_listening_msg)
 {
     int fd, n;
-
-    lwan_status_debug("Initializing sockets");
 
     n = sd_listen_fds(1);
     if (n > 1) {
@@ -250,7 +287,7 @@ void lwan_socket_init(struct lwan *l)
     } else if (n == 1) {
         fd = setup_socket_from_systemd();
     } else {
-        fd = setup_socket_normally(l);
+        fd = setup_socket_normally(l, print_listening_msg);
     }
 
     SET_SOCKET_OPTION(SOL_SOCKET, SO_LINGER,
@@ -262,13 +299,17 @@ void lwan_socket_init(struct lwan *l)
 #define TCP_FASTOPEN 23
 #endif
 
+    SET_SOCKET_OPTION_MAY_FAIL(SOL_SOCKET, SO_REUSEADDR, (int[]){1});
     SET_SOCKET_OPTION_MAY_FAIL(SOL_TCP, TCP_FASTOPEN, (int[]){5});
     SET_SOCKET_OPTION_MAY_FAIL(SOL_TCP, TCP_QUICKACK, (int[]){0});
     SET_SOCKET_OPTION_MAY_FAIL(SOL_TCP, TCP_DEFER_ACCEPT,
                                (int[]){(int)l->config.keep_alive_timeout});
+
+    if (is_reno_supported())
+        setsockopt(fd, IPPROTO_TCP, TCP_CONGESTION, "reno", 4);
 #endif
 
-    l->main_socket = fd;
+    return fd;
 }
 
 #undef SET_SOCKET_OPTION

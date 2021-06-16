@@ -18,10 +18,19 @@
  * USA.
  */
 
+#define _GNU_SOURCE
+#include <assert.h>
 #include <endian.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
 
-#include "lwan-private.h"
+#if defined(__x86_64__)
+#include <emmintrin.h>
+#endif
+
 #include "lwan-io-wrappers.h"
+#include "lwan-private.h"
 
 enum ws_opcode {
     WS_OPCODE_CONTINUATION = 0,
@@ -30,6 +39,20 @@ enum ws_opcode {
     WS_OPCODE_CLOSE = 8,
     WS_OPCODE_PING = 9,
     WS_OPCODE_PONG = 10,
+
+    WS_OPCODE_RSVD_1 = 3,
+    WS_OPCODE_RSVD_2 = 4,
+    WS_OPCODE_RSVD_3 = 5,
+    WS_OPCODE_RSVD_4 = 6,
+    WS_OPCODE_RSVD_5 = 7,
+
+    WS_OPCODE_RSVD_CONTROL_1 = 11,
+    WS_OPCODE_RSVD_CONTROL_2 = 12,
+    WS_OPCODE_RSVD_CONTROL_3 = 13,
+    WS_OPCODE_RSVD_CONTROL_4 = 14,
+    WS_OPCODE_RSVD_CONTROL_5 = 15,
+
+    WS_OPCODE_INVALID = 16,
 };
 
 static void write_websocket_frame(struct lwan_request *request,
@@ -80,136 +103,221 @@ void lwan_response_websocket_write(struct lwan_request *request)
 
 static void send_websocket_pong(struct lwan_request *request, size_t len)
 {
-    size_t generation;
-    char *temp;
+    char temp[128];
 
     if (UNLIKELY(len > 125)) {
         lwan_status_debug("Received PING opcode with length %zu."
                           "Max is 125. Aborting connection.",
                           len);
-        goto abort;
-    }
-
-    generation = coro_deferred_get_generation(request->conn->coro);
-
-    temp = coro_malloc(request->conn->coro, len);
-    if (UNLIKELY(!temp))
-        goto abort;
-
-    lwan_recv(request, temp, len, 0);
-    write_websocket_frame(request, WS_OPCODE_PONG, temp, len);
-
-    coro_deferred_run(request->conn->coro, generation);
-
-    return;
-
-abort:
-    coro_yield(request->conn->coro, CONN_CORO_ABORT);
-    __builtin_unreachable();
-}
-
-bool lwan_response_websocket_read(struct lwan_request *request)
-{
-    uint16_t header;
-    uint64_t len_frame;
-    char *msg;
-    bool continuation = false;
-    bool fin;
-
-    if (!(request->conn->flags & CONN_IS_WEBSOCKET))
-        return false;
-
-    lwan_strbuf_reset(request->response.buffer);
-
-next_frame:
-    lwan_recv(request, &header, sizeof(header), 0);
-
-    fin = (header & 0x8000);
-
-    switch ((enum ws_opcode)((header & 0xf00) >> 8)) {
-    case WS_OPCODE_CONTINUATION:
-        continuation = true;
-        break;
-    case WS_OPCODE_TEXT:
-    case WS_OPCODE_BINARY:
-        break;
-    case WS_OPCODE_CLOSE:
-        request->conn->flags &= ~CONN_IS_WEBSOCKET;
-        break;
-    case WS_OPCODE_PING:
-        /* FIXME: handling PING packets here doesn't seem ideal; they won't be
-         * handled, for instance, if the user never receives data from the
-         * websocket. */
-        send_websocket_pong(request, header & 0x7f);
-        goto next_frame;
-    default:
-        lwan_status_debug(
-            "Received unexpected WebSockets opcode: 0x%x, ignoring",
-            (header & 0xf00) >> 8);
-        goto next_frame;
-    }
-
-    switch (header & 0x7f) {
-    default:
-        len_frame = (uint64_t)(header & 0x7f);
-        break;
-    case 0x7e:
-        lwan_recv(request, &len_frame, 2, 0);
-        len_frame = (uint64_t)ntohs((uint16_t)len_frame);
-        break;
-    case 0x7f:
-        lwan_recv(request, &len_frame, 8, 0);
-        len_frame = be64toh(len_frame);
-        break;
-    }
-
-    size_t cur_len = lwan_strbuf_get_length(request->response.buffer);
-
-    if (UNLIKELY(!lwan_strbuf_grow_by(request->response.buffer, len_frame))) {
         coro_yield(request->conn->coro, CONN_CORO_ABORT);
         __builtin_unreachable();
     }
 
-    msg = lwan_strbuf_get_buffer(request->response.buffer) + cur_len;
+    lwan_recv(request, temp, len, 0);
+    write_websocket_frame(request, WS_OPCODE_PONG, temp, len);
+}
 
-    if (LIKELY(header & 0x80)) {
-        /* Payload is masked; should always be true on Client->Server comms but
-         * don't assume this is always the case. */
-        uint32_t mask;
-        struct iovec vec[] = {
-            {.iov_base = &mask, .iov_len = sizeof(mask)},
-            {.iov_base = msg, .iov_len = len_frame},
-        };
+static size_t get_frame_length(struct lwan_request *request, uint16_t header)
+{
+    uint64_t len;
 
-        lwan_readv(request, vec, N_ELEMENTS(vec));
+    switch (header & 0x7f) {
+    case 0x7e:
+        lwan_recv(request, &len, 2, 0);
+        len = (uint64_t)ntohs((uint16_t)len);
 
-        if (mask) {
-            uint64_t i;
+        if (len < 0x7e) {
+            lwan_status_warning("Can't use 16-bit encoding for frame length of %zu",
+                                len);
+            coro_yield(request->conn->coro, CONN_CORO_ABORT);
+            __builtin_unreachable();
+        }
 
-            for (i = 0; len_frame - i >= sizeof(mask); i += sizeof(mask)) {
-                uint32_t v;
+        return (size_t)len;
+    case 0x7f:
+        lwan_recv(request, &len, 8, 0);
+        len = be64toh(len);
 
-                memcpy(&v, &msg[i], sizeof(v));
-                v ^= mask;
-                memcpy(&msg[i], &v, sizeof(v));
-            }
+        if (UNLIKELY(len > SSIZE_MAX)) {
+            lwan_status_warning("Frame length of %zu won't fit a ssize_t",
+                                len);
+            coro_yield(request->conn->coro, CONN_CORO_ABORT);
+            __builtin_unreachable();
+        }
+        if (UNLIKELY(len <= 0xffff)) {
+            lwan_status_warning("Can't use 64-bit encoding for frame length of %zu",
+                                len);
+            coro_yield(request->conn->coro, CONN_CORO_ABORT);
+            __builtin_unreachable();
+        }
 
-            switch (i & 3) {
-            case 3: msg[i + 2] ^= (char)((mask >> 16) & 0xff); /* fallthrough */
-            case 2: msg[i + 1] ^= (char)((mask >> 8) & 0xff); /* fallthrough */
-            case 1: msg[i + 0] ^= (char)(mask & 0xff);
+        return (size_t)len;
+    default:
+        return (size_t)(header & 0x7f);
+    }
+}
+
+static void discard_frame(struct lwan_request *request, uint16_t header)
+{
+    size_t len = get_frame_length(request, header);
+#if defined(__linux__)
+    /* MSG_TRUNC for TCP sockets is only supported the way we need here
+     * on Linux. */
+    int flags = MSG_TRUNC;
+#else
+    /* On other OSes, we need to actually read into the buffer in order
+     * to discard the data. */
+    int flags = 0;
+#endif
+
+    for (char buffer[1024]; len;) {
+        const size_t to_read = LWAN_MIN(len, sizeof(buffer));
+        len -= (size_t)lwan_recv(request, buffer, to_read, flags);
+    }
+}
+
+static void unmask(char *msg, size_t msg_len, char mask[static 4])
+{
+    const uint32_t mask32 = string_as_uint32(mask);
+    char *msg_end = msg + msg_len;
+
+    if (sizeof(void *) == 8) {
+        const uint64_t mask64 = (uint64_t)mask32 << 32 | mask32;
+
+#if defined(__x86_64__)
+        const size_t len128 = msg_len / 16;
+        if (len128) {
+            const __m128i mask128 = _mm_setr_epi64((__m64)mask64, (__m64)mask64);
+            for (size_t i = 0; i < len128; i++) {
+                __m128i v = _mm_loadu_si128((__m128i *)msg);
+                _mm_storeu_si128((__m128i *)msg, _mm_xor_si128(v, mask128));
+                msg += 16;
             }
         }
-    } else {
-        lwan_recv(request, msg, len_frame, 0);
+#endif
+
+        const size_t len64 = (size_t)((msg_end - msg) / 8);
+        for (size_t i = 0; i < len64; i++) {
+            uint64_t v = string_as_uint64(msg);
+            v ^= mask64;
+            msg = mempcpy(msg, &v, sizeof(v));
+        }
     }
 
-    if (continuation && !fin) {
-        coro_yield(request->conn->coro, CONN_CORO_WANT_READ);
-        continuation = false;
+    const size_t len32 = (size_t)((msg_end - msg) / 4);
+    for (size_t i = 0; i < len32; i++) {
+        uint32_t v = string_as_uint32(msg);
+        v ^= mask32;
+        msg = mempcpy(msg, &v, sizeof(v));
+    }
 
+    switch (msg_end - msg) {
+    case 3:
+        msg[2] ^= mask[2]; /* fallthrough */
+    case 2:
+        msg[1] ^= mask[1]; /* fallthrough */
+    case 1:
+        msg[0] ^= mask[0];
+    }
+}
+
+int lwan_response_websocket_read_hint(struct lwan_request *request, size_t size_hint)
+{
+    enum ws_opcode opcode = WS_OPCODE_INVALID;
+    enum ws_opcode last_opcode;
+    uint16_t header;
+    bool continuation = false;
+
+    if (!(request->conn->flags & CONN_IS_WEBSOCKET))
+        return ENOTCONN;
+
+    lwan_strbuf_reset_trim(request->response.buffer, size_hint);
+
+next_frame:
+    last_opcode = opcode;
+
+    if (!lwan_recv(request, &header, sizeof(header), continuation ? 0 : MSG_DONTWAIT))
+        return EAGAIN;
+    header = htons(header);
+    continuation = false;
+
+    if (UNLIKELY(header & 0x7000)) {
+        lwan_status_debug("RSV1...RSV3 has non-zero value %d, aborting", header & 0x7000);
+        /* No extensions are supported yet, so fail connection per RFC6455. */
+        coro_yield(request->conn->coro, CONN_CORO_ABORT);
+        __builtin_unreachable();
+    }
+    if (UNLIKELY(!(header & 0x80))) {
+        lwan_status_debug("Client sent an unmasked WebSockets frame, aborting");
+        coro_yield(request->conn->coro, CONN_CORO_ABORT);
+        __builtin_unreachable();
+    }
+
+    opcode = (header & 0x0f00) >> 8;
+    switch (opcode) {
+    case WS_OPCODE_CONTINUATION:
+        if (UNLIKELY(last_opcode > WS_OPCODE_BINARY)) {
+            /* Continuation frames are only available for opcodes [0..2] */
+            coro_yield(request->conn->coro, CONN_CORO_ABORT);
+            __builtin_unreachable();
+        }
+
+        continuation = true;
+        break;
+
+    case WS_OPCODE_TEXT:
+    case WS_OPCODE_BINARY:
+        break;
+
+    case WS_OPCODE_CLOSE:
+        request->conn->flags &= ~CONN_IS_WEBSOCKET;
+        break;
+
+    case WS_OPCODE_PING:
+        send_websocket_pong(request, header & 0x7f);
         goto next_frame;
+
+    case WS_OPCODE_PONG:
+        lwan_status_debug("Received unsolicited PONG frame, discarding frame");
+        discard_frame(request, header);
+        goto next_frame;
+
+    case WS_OPCODE_RSVD_1 ... WS_OPCODE_RSVD_5:
+    case WS_OPCODE_RSVD_CONTROL_1 ... WS_OPCODE_RSVD_CONTROL_5:
+    case WS_OPCODE_INVALID:
+        /* RFC6455: ...the receiving endpoint MUST _Fail the WebSocket Connection_ */
+        coro_yield(request->conn->coro, CONN_CORO_ABORT);
+        __builtin_unreachable();
     }
 
-    return request->conn->flags & CONN_IS_WEBSOCKET;
+    size_t frame_len = get_frame_length(request, header);
+    char *msg = lwan_strbuf_extend_unsafe(request->response.buffer, frame_len);
+    if (UNLIKELY(!msg)) {
+        coro_yield(request->conn->coro, CONN_CORO_ABORT);
+        __builtin_unreachable();
+    }
+
+    char mask[4];
+    struct iovec vec[] = {
+        {.iov_base = mask, .iov_len = sizeof(mask)},
+        {.iov_base = msg, .iov_len = frame_len},
+    };
+    lwan_readv(request, vec, N_ELEMENTS(vec));
+    unmask(msg, frame_len, mask);
+
+    if (continuation && !(header & 0x8000))
+        goto next_frame;
+
+    return (request->conn->flags & CONN_IS_WEBSOCKET) ? 0 : ECONNRESET;
+}
+
+inline int lwan_response_websocket_read(struct lwan_request *request)
+{
+    /* Ensure that a rogue client won't keep increasing the memory usage in an
+     * uncontrolled manner by curbing the backing store to 1KB at most by default.
+     * If an application expects messages to be larger than 1024 bytes on average,
+     * they can call lwan_response_websocket_read_hint() directly with a larger
+     * value to avoid malloc chatter (things should still work, but will be
+     * slightly more inefficient). */
+    return lwan_response_websocket_read_hint(request, 1024);
 }

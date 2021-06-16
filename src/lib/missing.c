@@ -29,6 +29,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include "lwan.h"
@@ -48,7 +49,7 @@ void *memrchr(const void *s, int c, size_t n)
     const char *prev = NULL;
 
     for (const char *cur = s; cur <= end; prev = cur++) {
-        cur = (const char *)memchr(cur, c, (size_t)(ptrdiff_t)(end - cur));
+        cur = (const char *)memchr(cur, c, (size_t)(end - cur));
         if (!cur)
             break;
     }
@@ -598,5 +599,60 @@ size_t fwrite_unlocked(const void *ptr, size_t size, size_t n, FILE *stream)
     }
 
     return (total_to_write - to_write) / size;
+}
+#endif
+
+#if !defined(HAVE_STATFS)
+int statfs(const char *path, struct statfs *buf)
+{
+    (void)path;
+    (void)buf;
+
+    *errno = ENOSYS;
+    return -1;
+}
+#endif
+
+static int lwan_getentropy_fallback(void *buffer, size_t buffer_len)
+{
+    int fd;
+
+    fd = open("/dev/urandom", O_CLOEXEC | O_RDONLY);
+    if (fd < 0) {
+        fd = open("/dev/random", O_CLOEXEC | O_RDONLY);
+        if (fd < 0)
+            return -1;
+    }
+    ssize_t total_read = read(fd, buffer, buffer_len);
+    close(fd);
+
+    return total_read == (ssize_t)buffer_len ? 0 : -1;
+}
+
+#if defined(SYS_getrandom)
+long int lwan_getentropy(void *buffer, size_t buffer_len, int flags)
+{
+    long r = syscall(SYS_getrandom, buffer, buffer_len, flags);
+
+    if (r < 0)
+        return lwan_getentropy_fallback(buffer, buffer_len);
+
+    return r;
+}
+#elif defined(HAVE_GETENTROPY)
+long int lwan_getentropy(void *buffer, size_t buffer_len, int flags)
+{
+    (void)flags;
+
+    if (!getentropy(buffer, buffer_len))
+        return buffer_len;
+
+    return lwan_getentropy_fallback(buffer, buffer_len);
+}
+#else
+long int lwan_getentropy(void *buffer, size_t buffer_len, int flags)
+{
+    (void)flags;
+    return lwan_getentropy_fallback(buffer, buffer_len);
 }
 #endif

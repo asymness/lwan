@@ -1,5 +1,5 @@
 project(lwan C)
-cmake_minimum_required(VERSION 2.8.10)
+cmake_minimum_required(VERSION 3.0)
 set(PROJECT_DESCRIPTION "Scalable, high performance, experimental web server")
 message(STATUS "Running CMake for ${PROJECT_NAME} (${PROJECT_DESCRIPTION})")
 
@@ -98,6 +98,16 @@ if (USE_ALTERNATIVE_MALLOC)
 	endif ()
 endif ()
 
+###
+# syslog
+option(USE_SYSLOG "Enable syslog" "OFF")
+if (${USE_SYSLOG} STREQUAL "ON" AND HAVE_SYSLOG_FUNC)
+    set(HAVE_SYSLOG 1)
+endif ()
+if (HAVE_SYSLOG)
+    message(STATUS "Using syslog/rsyslog for logging.")
+endif ()
+
 #
 # Look for C library functions
 #
@@ -111,6 +121,7 @@ set(CMAKE_EXTRA_INCLUDE_FILES
 	time.h
 	unistd.h
 	dlfcn.h
+	syslog.h
 )
 check_include_file(linux/capability.h HAVE_LINUX_CAPABILITY)
 check_include_file(sys/auxv.h HAVE_SYS_AUXV)
@@ -145,12 +156,13 @@ check_function_exists(mkostemp HAVE_MKOSTEMP)
 check_function_exists(clock_gettime HAVE_CLOCK_GETTIME)
 check_function_exists(pthread_barrier_init HAVE_PTHREADBARRIER)
 check_function_exists(pthread_set_name_np HAVE_PTHREAD_SET_NAME_NP)
-check_function_exists(eventfd HAVE_EVENTFD)
 check_function_exists(posix_fadvise HAVE_POSIX_FADVISE)
 check_function_exists(getentropy HAVE_GETENTROPY)
 check_function_exists(fwrite_unlocked HAVE_FWRITE_UNLOCKED)
 check_function_exists(gettid HAVE_GETTID)
 check_function_exists(secure_getenv HAVE_SECURE_GETENV)
+check_function_exists(statfs HAVE_STATFS)
+check_function_exists(syslog HAVE_SYSLOG_FUNC)
 
 # This is available on -ldl in glibc, but some systems (such as OpenBSD)
 # will bundle these in the C library.  This isn't required for glibc anyway,
@@ -181,7 +193,17 @@ check_c_source_compiles("int main(void) { __builtin_fpclassify(0, 0, 0, 0, 0, 0.
 check_c_source_compiles("int main(void) { unsigned long long p; (void)__builtin_mul_overflow(0, 0, &p); }" HAVE_BUILTIN_MUL_OVERFLOW)
 check_c_source_compiles("int main(void) { unsigned long long p; (void)__builtin_add_overflow(0, 0, &p); }" HAVE_BUILTIN_ADD_OVERFLOW)
 check_c_source_compiles("int main(void) { _Static_assert(1, \"\"); }" HAVE_STATIC_ASSERT)
-
+check_c_source_compiles("#include <linux/filter.h>
+#include <sys/socket.h>
+#include <stddef.h>
+int main(void) {
+	setsockopt(0, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, NULL, 0);
+}" HAVE_SO_ATTACH_REUSEPORT_CBPF)
+check_c_source_compiles("#include <sys/socket.h>
+#include <stddef.h>
+int main(void) {
+	setsockopt(0, SOL_SOCKET, SO_INCOMING_CPU, NULL, 0);
+}" HAVE_SO_INCOMING_CPU)
 
 #
 # Look for Valgrind header
@@ -195,14 +217,6 @@ if (VALGRIND_INCLUDE_DIR)
 else ()
 	message(STATUS "Valgrind headers not found -- disabling valgrind support")
 endif()
-
-if (EXISTS ${CMAKE_SOURCE_DIR}/src/gcda/lwan.gcov)
-	enable_c_flag_if_avail(-fauto-profile=${CMAKE_SOURCE_DIR}/src/gcda/lwan.gcov
-				C_FLAGS_REL HAVE_AUTO_PROFILE)
-	if (HAVE_AUTO_PROFILE)
-		message(STATUS "Using AutoFDO profile")
-	endif ()
-endif ()
 
 enable_c_flag_if_avail(-mtune=native C_FLAGS_REL HAVE_MTUNE_NATIVE)
 enable_c_flag_if_avail(-march=native C_FLAGS_REL HAVE_MARCH_NATIVE)
@@ -224,6 +238,8 @@ else ()
 		HAVE_READ_ONLY_GOT)
 	enable_c_flag_if_avail(-fno-plt CMAKE_C_FLAGS
 		HAVE_NO_PLT)
+	enable_c_flag_if_avail(-no-pie CMAKE_C_FLAGS
+		HAVE_NO_PIE)
 	enable_c_flag_if_avail(-Wl,-z,noexecstack CMAKE_EXE_LINKER_FLAGS
 		HAVE_NOEXEC_STACK)
 endif ()
@@ -234,10 +250,7 @@ if (${CMAKE_BUILD_TYPE} MATCHES "Rel")
 	enable_c_flag_if_avail(-malign-data=abi C_FLAGS_REL HAVE_ALIGN_DATA)
 	enable_c_flag_if_avail(-fno-asynchronous-unwind-tables C_FLAGS_REL HAVE_NO_ASYNC_UNWIND_TABLES)
 
-	enable_c_flag_if_avail(-flto=jobserver C_FLAGS_REL HAVE_LTO_JOBSERVER)
-	if (NOT HAVE_LTO_JOBSERVER)
-		enable_c_flag_if_avail(-flto C_FLAGS_REL HAVE_LTO)
-	endif ()
+	enable_c_flag_if_avail(-fPIC -flto C_FLAGS_REL HAVE_LTO)
 
 	enable_c_flag_if_avail(-ffat-lto-objects C_FLAGS_REL HAVE_LTO_FAT_OBJS)
 	enable_c_flag_if_avail(-mcrc32 C_FLAGS_REL HAVE_BUILTIN_IA32_CRC32)
@@ -284,6 +297,10 @@ if (APPLE)
 	set(LWAN_COMMON_LIBS -Wl,-force_load lwan-static)
 else ()
 	set(LWAN_COMMON_LIBS -Wl,-whole-archive lwan-static -Wl,-no-whole-archive)
+endif ()
+
+if (NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^i[3456]86|x86_64")
+	set(HAVE_LIBUCONTEXT 1)
 endif ()
 
 include_directories(src/lib)

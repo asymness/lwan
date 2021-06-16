@@ -31,7 +31,6 @@ extern "C" {
 #include <string.h>
 
 #include "hash.h"
-#include "queue.h"
 #include "timeout.h"
 #include "lwan-array.h"
 #include "lwan-config.h"
@@ -55,11 +54,6 @@ extern "C" {
 #define N_ELEMENTS(array)                                                      \
     (ZERO_IF_IS_ARRAY(array) | sizeof(array) / sizeof(array[0]))
 
-#define LWAN_NO_DISCARD(...)                                                   \
-    do {                                                                       \
-        __typeof__(__VA_ARGS__) no_discard_ = __VA_ARGS__;                     \
-        __asm__ __volatile__("" ::"g"(no_discard_) : "memory");                \
-    } while (0)
 
 #ifdef __APPLE__
 #define LWAN_SECTION_NAME(name_) "__DATA," #name_
@@ -206,21 +200,23 @@ enum lwan_http_status {
 #undef GENERATE_ENUM_ITEM
 
 enum lwan_handler_flags {
-    HANDLER_HAS_POST_DATA = 1 << 0,
+    HANDLER_EXPECTS_BODY_DATA = 1 << 0,
     HANDLER_MUST_AUTHORIZE = 1 << 1,
     HANDLER_CAN_REWRITE_URL = 1 << 2,
     HANDLER_DATA_IS_HASH_TABLE = 1 << 3,
 
-    HANDLER_PARSE_MASK = HANDLER_HAS_POST_DATA,
+    HANDLER_PARSE_MASK = HANDLER_EXPECTS_BODY_DATA,
 };
 
 /* 1<<0 set: response has body; see has_response_body() in lwan-response.c */
+/* 1<<3 set: request has body; see request_has_body() in lwan-request.c */
 #define FOR_EACH_REQUEST_METHOD(X)                                             \
     X(GET, get, (1 << 0), STR4_INT('G', 'E', 'T', ' '))                        \
-    X(POST, post, (1 << 1 | 1 << 0), STR4_INT('P', 'O', 'S', 'T'))             \
+    X(POST, post, (1 << 3 | 1 << 1 | 1 << 0), STR4_INT('P', 'O', 'S', 'T'))    \
     X(HEAD, head, (1 << 1), STR4_INT('H', 'E', 'A', 'D'))                      \
     X(OPTIONS, options, (1 << 2), STR4_INT('O', 'P', 'T', 'I'))                \
-    X(DELETE, delete, (1 << 1 | 1 << 2), STR4_INT('D', 'E', 'L', 'E'))
+    X(DELETE, delete, (1 << 1 | 1 << 2), STR4_INT('D', 'E', 'L', 'E'))         \
+    X(PUT, put, (1 << 3 | 1 << 2 | 1 << 0), STR4_INT('P', 'U', 'T', ' '))
 
 #define SELECT_MASK(upper, lower, mask, constant) mask |
 #define GENERATE_ENUM_ITEM(upper, lower, mask, constant) REQUEST_METHOD_##upper = mask,
@@ -231,40 +227,37 @@ enum lwan_request_flags {
     REQUEST_METHOD_MASK = FOR_EACH_REQUEST_METHOD(SELECT_MASK) 0,
     FOR_EACH_REQUEST_METHOD(GENERATE_ENUM_ITEM)
 
-    REQUEST_ACCEPT_DEFLATE = 1 << 3,
-    REQUEST_ACCEPT_GZIP = 1 << 4,
-    REQUEST_ACCEPT_BROTLI = 1 << 5,
-    REQUEST_ACCEPT_ZSTD = 1 << 6,
-    REQUEST_ACCEPT_MASK = 1 << 3 | 1 << 4 | 1 << 5 | 1 << 6,
+    REQUEST_ACCEPT_DEFLATE = 1 << 4,
+    REQUEST_ACCEPT_GZIP = 1 << 5,
+    REQUEST_ACCEPT_BROTLI = 1 << 6,
+    REQUEST_ACCEPT_ZSTD = 1 << 7,
+    REQUEST_ACCEPT_MASK = 1 << 4 | 1 << 5 | 1 << 6 | 1 << 7,
 
-    REQUEST_IS_HTTP_1_0 = 1 << 7,
-    REQUEST_ALLOW_PROXY_REQS = 1 << 8,
-    REQUEST_PROXIED = 1 << 9,
-    REQUEST_ALLOW_CORS = 1 << 10,
+    REQUEST_IS_HTTP_1_0 = 1 << 8,
+    REQUEST_ALLOW_PROXY_REQS = 1 << 9,
+    REQUEST_PROXIED = 1 << 10,
+    REQUEST_ALLOW_CORS = 1 << 11,
 
-    RESPONSE_SENT_HEADERS = 1 << 11,
-    RESPONSE_CHUNKED_ENCODING = 1 << 12,
-    RESPONSE_NO_CONTENT_LENGTH = 1 << 13,
-    RESPONSE_URL_REWRITTEN = 1 << 14,
+    RESPONSE_SENT_HEADERS = 1 << 12,
+    RESPONSE_CHUNKED_ENCODING = 1 << 13,
+    RESPONSE_NO_CONTENT_LENGTH = 1 << 14,
+    RESPONSE_NO_EXPIRES = 1 << 15,
+    RESPONSE_URL_REWRITTEN = 1 << 16,
 
-    RESPONSE_STREAM = 1 << 15,
+    RESPONSE_STREAM = 1 << 17,
 
-    REQUEST_PARSED_QUERY_STRING = 1 << 16,
-    REQUEST_PARSED_IF_MODIFIED_SINCE = 1 << 17,
-    REQUEST_PARSED_RANGE = 1 << 18,
-    REQUEST_PARSED_POST_DATA = 1 << 19,
-    REQUEST_PARSED_COOKIES = 1 << 20,
-    REQUEST_PARSED_ACCEPT_ENCODING = 1 << 21,
+    REQUEST_PARSED_QUERY_STRING = 1 << 18,
+    REQUEST_PARSED_IF_MODIFIED_SINCE = 1 << 19,
+    REQUEST_PARSED_RANGE = 1 << 20,
+    REQUEST_PARSED_FORM_DATA = 1 << 21,
+    REQUEST_PARSED_COOKIES = 1 << 22,
+    REQUEST_PARSED_ACCEPT_ENCODING = 1 << 23,
+
+    RESPONSE_INCLUDE_REQUEST_ID = 1 << 24,
 };
 
 #undef SELECT_MASK
 #undef GENERATE_ENUM_ITEM
-
-/* Ideally, this would check if all items in enum lwan_request_flags,
- * when bitwise-or'd together, would not have have any bit set that
- * is also set in REQUEST_METHOD_MASK. */
-static_assert(REQUEST_ACCEPT_DEFLATE > REQUEST_METHOD_MASK,
-              "enough bits to store request methods");
 
 enum lwan_connection_flags {
     CONN_MASK = -1,
@@ -282,19 +275,17 @@ enum lwan_connection_flags {
 
     /* This is only used to determine if timeout_del() is necessary when
      * the connection coro ends. */
-    CONN_SUSPENDED_TIMER = 1 << 5,
+    CONN_SUSPENDED = 1 << 5,
     CONN_HAS_REMOVE_SLEEP_DEFER = 1 << 6,
 
-    CONN_SUSPENDED_ASYNC_AWAIT = 1 << 7,
-
-    CONN_SUSPENDED = CONN_SUSPENDED_TIMER | CONN_SUSPENDED_ASYNC_AWAIT,
-
-    CONN_CORK = 1 << 8,
+    CONN_CORK = 1 << 7,
 
     /* Set only on file descriptors being watched by async/await to determine
      * which epoll operation to use when suspending/resuming (ADD/MOD). Reset
      * whenever associated client connection is closed. */
-    CONN_ASYNC_AWAIT = 1 << 9,
+    CONN_ASYNC_AWAIT = 1 << 8,
+
+    CONN_SENT_CONNECTION_HEADER = 1 << 9,
 };
 
 enum lwan_connection_coro_yield {
@@ -306,8 +297,7 @@ enum lwan_connection_coro_yield {
     CONN_CORO_WANT_WRITE,
     CONN_CORO_WANT_READ_WRITE,
 
-    CONN_CORO_SUSPEND_TIMER,
-    CONN_CORO_SUSPEND_ASYNC_AWAIT,
+    CONN_CORO_SUSPEND,
     CONN_CORO_RESUME,
 
     /* Group async stuff together to make it easier to check if a connection
@@ -374,16 +364,18 @@ struct lwan_request_parser_helper;
 struct lwan_request {
     enum lwan_request_flags flags;
     int fd;
-    struct lwan_value url;
-    struct lwan_value original_url;
     struct lwan_connection *conn;
     const struct lwan_strbuf *const global_response_headers;
-    struct lwan_proxy *proxy;
 
-    struct timeout timeout;
-
+    uint64_t request_id;
     struct lwan_request_parser_helper *helper;
+
+    struct lwan_value url;
+    struct lwan_value original_url;
     struct lwan_response response;
+
+    struct lwan_proxy *proxy;
+    struct timeout timeout;
 };
 
 struct lwan_module {
@@ -442,10 +434,10 @@ struct lwan_thread {
         char date[30];
         char expires[30];
     } date;
-    struct spsc_queue pending_fds;
     struct timeouts *wheel;
     int epoll_fd;
-    int pipe_fd[2];
+    int listen_fd;
+    unsigned int cpu;
     pthread_t self;
 };
 
@@ -465,16 +457,17 @@ struct lwan_config {
     char *config_file_path;
 
     size_t max_post_data_size;
+    size_t max_put_data_size;
 
     unsigned int keep_alive_timeout;
     unsigned int expires;
     unsigned int n_threads;
 
     bool quiet;
-    bool reuse_port;
     bool proxy_protocol;
     bool allow_cors;
     bool allow_post_temp_file;
+    bool allow_put_temp_file;
 };
 
 struct lwan {
@@ -492,18 +485,14 @@ struct lwan {
     struct lwan_config config;
     struct coro_switcher switcher;
 
-    int main_socket;
-
-    unsigned int n_cpus;
+    unsigned int online_cpus;
+    unsigned int available_cpus;
 };
 
 void lwan_set_url_map(struct lwan *l, const struct lwan_url_map *map);
 void lwan_add_url_map(struct lwan *l, const struct lwan_url_map *map);
 void lwan_main_loop(struct lwan *l);
 
-void lwan_response(struct lwan_request *request, enum lwan_http_status status);
-void lwan_default_response(struct lwan_request *request,
-                           enum lwan_http_status status);
 size_t lwan_prepare_response_header(struct lwan_request *request,
                                     enum lwan_http_status status,
                                     char header_buffer[],
@@ -533,15 +522,6 @@ bool lwan_response_set_event_stream(struct lwan_request *request,
                                     enum lwan_http_status status);
 void lwan_response_send_event(struct lwan_request *request, const char *event);
 
-void lwan_response_websocket_write(struct lwan_request *request);
-bool lwan_response_websocket_read(struct lwan_request *request);
-
-const char *lwan_http_status_as_string(enum lwan_http_status status)
-    __attribute__((const)) __attribute__((warn_unused_result));
-const char *lwan_http_status_as_string_with_code(enum lwan_http_status status)
-    __attribute__((const)) __attribute__((warn_unused_result));
-const char *lwan_http_status_as_descriptive_string(enum lwan_http_status status)
-    __attribute__((const)) __attribute__((warn_unused_result));
 const char *lwan_determine_mime_type_for_file_name(const char *file_name)
     __attribute__((pure)) __attribute__((warn_unused_result));
 
@@ -549,21 +529,13 @@ void lwan_init(struct lwan *l);
 void lwan_init_with_config(struct lwan *l, const struct lwan_config *config);
 void lwan_shutdown(struct lwan *l);
 
-void lwan_straitjacket_enforce(const struct lwan_straitjacket *sj);
-
 const struct lwan_config *lwan_get_default_config(void);
-
-int lwan_connection_get_fd(const struct lwan *lwan,
-                           const struct lwan_connection *conn)
-    __attribute__((pure)) __attribute__((warn_unused_result));
 
 const char *
 lwan_request_get_remote_address(struct lwan_request *request,
                                 char buffer LWAN_ARRAY_PARAM(INET6_ADDRSTRLEN))
     __attribute__((warn_unused_result));
 
-int lwan_format_rfc_time(const time_t in, char out LWAN_ARRAY_PARAM(30));
-int lwan_parse_rfc_time(const char in LWAN_ARRAY_PARAM(30), time_t *out);
 
 static inline enum lwan_request_flags
 lwan_request_get_method(const struct lwan_request *request)
@@ -591,6 +563,9 @@ lwan_request_get_accept_encoding(struct lwan_request *request);
 
 enum lwan_http_status
 lwan_request_websocket_upgrade(struct lwan_request *request);
+void lwan_response_websocket_write(struct lwan_request *request);
+int lwan_response_websocket_read(struct lwan_request *request);
+int lwan_response_websocket_read_hint(struct lwan_request *request, size_t size_hint);
 
 void lwan_request_await_read(struct lwan_request *r, int fd);
 void lwan_request_await_write(struct lwan_request *r, int fd);

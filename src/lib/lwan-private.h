@@ -24,8 +24,44 @@
 
 #include "lwan.h"
 
+struct lwan_request_parser_helper {
+    struct lwan_value *buffer;		/* The whole request buffer */
+    char *next_request;			/* For pipelined requests */
+
+    char **header_start;		/* Headers: n: start, n+1: end */
+    size_t n_header_start;		/* len(header_start) */
+
+    struct lwan_value accept_encoding;	/* Accept-Encoding: */
+
+    struct lwan_value query_string;	/* Stuff after ? and before # */
+
+    struct lwan_value body_data; /* Request body for POST and PUT */
+    struct lwan_value content_type;	/* Content-Type: for POST and PUT */
+    struct lwan_value content_length;	/* Content-Length: */
+
+    struct lwan_value connection;	/* Connection: */
+
+    struct lwan_key_value_array cookies, query_params, post_params;
+
+    struct { /* If-Modified-Since: */
+        struct lwan_value raw;
+        time_t parsed;
+    } if_modified_since;
+
+    struct { /* Range: */
+        struct lwan_value raw;
+        off_t from, to;
+    } range;
+
+    time_t error_when_time;		/* Time to abort request read */
+    int error_when_n_packets;		/* Max. number of packets */
+    int urls_rewritten;			/* Times URLs have been rewritten */
+};
+
 #define DEFAULT_BUFFER_SIZE 4096
 #define DEFAULT_HEADERS_SIZE 512
+
+#define N_HEADER_START 64
 
 #define LWAN_CONCAT(a_, b_) a_ ## b_
 #define LWAN_TMP_ID_DETAIL(n_) LWAN_CONCAT(lwan_tmp_id, n_)
@@ -49,18 +85,16 @@ void lwan_set_thread_name(const char *name);
 void lwan_response_init(struct lwan *l);
 void lwan_response_shutdown(struct lwan *l);
 
-void lwan_socket_init(struct lwan *l);
-void lwan_socket_shutdown(struct lwan *l);
+int lwan_create_listen_socket(struct lwan *l, bool print_listening_msg);
 
 void lwan_thread_init(struct lwan *l);
 void lwan_thread_shutdown(struct lwan *l);
-void lwan_thread_add_client(struct lwan_thread *t, int fd);
-void lwan_thread_nudge(struct lwan_thread *t);
 
 void lwan_status_init(struct lwan *l);
 void lwan_status_shutdown(struct lwan *l);
 
 void lwan_job_thread_init(void);
+void lwan_job_thread_main_loop(void);
 void lwan_job_thread_shutdown(void);
 void lwan_job_add(bool (*cb)(void *data), void *data);
 void lwan_job_del(bool (*cb)(void *data), void *data);
@@ -73,11 +107,18 @@ void lwan_readahead_shutdown(void);
 void lwan_readahead_queue(int fd, off_t off, size_t size);
 void lwan_madvise_queue(void *addr, size_t size);
 
-char *lwan_process_request(struct lwan *l, struct lwan_request *request,
-                           struct lwan_value *buffer, char *next_request);
+char *lwan_strbuf_extend_unsafe(struct lwan_strbuf *s, size_t by);
+
+void lwan_process_request(struct lwan *l, struct lwan_request *request);
 size_t lwan_prepare_response_header_full(struct lwan_request *request,
      enum lwan_http_status status, char headers[],
      size_t headers_buf_size, const struct lwan_key_value *additional_headers);
+
+void lwan_response(struct lwan_request *request, enum lwan_http_status status);
+void lwan_default_response(struct lwan_request *request,
+                           enum lwan_http_status status);
+void lwan_fill_default_response(struct lwan_strbuf *buffer,
+                                enum lwan_http_status status);
 
 void lwan_straitjacket_enforce_from_config(struct config *c);
 
@@ -87,7 +128,7 @@ uint8_t lwan_char_isspace(char ch) __attribute__((pure));
 uint8_t lwan_char_isxdigit(char ch) __attribute__((pure));
 uint8_t lwan_char_isdigit(char ch) __attribute__((pure));
 
-static ALWAYS_INLINE size_t lwan_nextpow2(size_t number)
+static ALWAYS_INLINE __attribute__((pure)) size_t lwan_nextpow2(size_t number)
 {
 #if defined(HAVE_BUILTIN_CLZLL)
     static const int size_bits = (int)sizeof(number) * CHAR_BIT;
@@ -109,6 +150,9 @@ static ALWAYS_INLINE size_t lwan_nextpow2(size_t number)
     number |= number >> 4;
     number |= number >> 8;
     number |= number >> 16;
+#if __SIZE_WIDTH__ == 64
+    number |= number >> 32;
+#endif
 
     return number + 1;
 }
@@ -121,6 +165,16 @@ lua_State *lwan_lua_create_state(const char *script_file, const char *script);
 void lwan_lua_state_push_request(lua_State *L, struct lwan_request *request);
 const char *lwan_lua_state_last_error(lua_State *L);
 #endif
+
+/* This macro is used as an attempt to convince the compiler that it should
+ * never elide an expression -- for instance, when writing fuzz-test or
+ * micro-benchmarks. */
+#define LWAN_NO_DISCARD(...)                                                   \
+    do {                                                                       \
+        __typeof__(__VA_ARGS__) no_discard_ = __VA_ARGS__;                     \
+        __asm__ __volatile__("" ::"g"(no_discard_) : "memory");                \
+    } while (0)
+
 
 #ifdef __APPLE__
 #define SECTION_START(name_) __start_##name_[] __asm("section$start$__DATA$" #name_)
@@ -161,3 +215,29 @@ lwan_aligned_alloc(size_t n, size_t alignment)
 
     return ret;
 }
+
+static ALWAYS_INLINE int lwan_calculate_n_packets(size_t total)
+{
+    /* 740 = 1480 (a common MTU) / 2, so that Lwan'll optimistically error out
+     * after ~2x number of expected packets to fully read the request body.*/
+    return LWAN_MAX(5, (int)(total / 740));
+}
+
+long int lwan_getentropy(void *buffer, size_t buffer_len, int flags);
+uint64_t lwan_random_uint64();
+
+const char *lwan_http_status_as_string(enum lwan_http_status status)
+    __attribute__((const)) __attribute__((warn_unused_result));
+const char *lwan_http_status_as_string_with_code(enum lwan_http_status status)
+    __attribute__((const)) __attribute__((warn_unused_result));
+const char *lwan_http_status_as_descriptive_string(enum lwan_http_status status)
+    __attribute__((const)) __attribute__((warn_unused_result));
+
+int lwan_connection_get_fd(const struct lwan *lwan,
+                           const struct lwan_connection *conn)
+    __attribute__((pure)) __attribute__((warn_unused_result));
+
+int lwan_format_rfc_time(const time_t in, char out LWAN_ARRAY_PARAM(30));
+int lwan_parse_rfc_time(const char in LWAN_ARRAY_PARAM(30), time_t *out);
+
+void lwan_straitjacket_enforce(const struct lwan_straitjacket *sj);

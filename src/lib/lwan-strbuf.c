@@ -28,6 +28,7 @@
 
 static const unsigned int BUFFER_MALLOCD = 1 << 0;
 static const unsigned int STRBUF_MALLOCD = 1 << 1;
+static const unsigned int BUFFER_FIXED = 1 << 2;
 
 static inline size_t align_size(size_t unaligned_size)
 {
@@ -41,6 +42,9 @@ static inline size_t align_size(size_t unaligned_size)
 
 static bool grow_buffer_if_needed(struct lwan_strbuf *s, size_t size)
 {
+    if (s->flags & BUFFER_FIXED)
+        return size < s->capacity;
+
     if (!(s->flags & BUFFER_MALLOCD)) {
         const size_t aligned_size = align_size(LWAN_MAX(size + 1, s->used));
         if (UNLIKELY(!aligned_size))
@@ -81,16 +85,31 @@ bool lwan_strbuf_init_with_size(struct lwan_strbuf *s, size_t size)
     if (UNLIKELY(!s))
         return false;
 
-    if (!size) {
-        *s = LWAN_STRBUF_STATIC_INIT;
-    } else {
-        memset(s, 0, sizeof(*s));
+    *s = LWAN_STRBUF_STATIC_INIT;
 
+    if (size) {
         if (UNLIKELY(!grow_buffer_if_needed(s, size)))
             return false;
 
         s->buffer[0] = '\0';
     }
+
+    return true;
+}
+
+bool lwan_strbuf_init_with_fixed_buffer(struct lwan_strbuf *s,
+                                        void *buffer,
+                                        size_t size)
+{
+    if (UNLIKELY(!s))
+        return false;
+
+    *s = (struct lwan_strbuf) {
+        .capacity = size,
+        .used = 0,
+        .buffer = buffer,
+        .flags = BUFFER_FIXED,
+    };
 
     return true;
 }
@@ -105,6 +124,21 @@ struct lwan_strbuf *lwan_strbuf_new_with_size(size_t size)
     struct lwan_strbuf *s = malloc(sizeof(*s));
 
     if (UNLIKELY(!lwan_strbuf_init_with_size(s, size))) {
+        free(s);
+
+        return NULL;
+    }
+
+    s->flags |= STRBUF_MALLOCD;
+
+    return s;
+}
+
+struct lwan_strbuf *lwan_strbuf_new_with_fixed_buffer(size_t size)
+{
+    struct lwan_strbuf *s = malloc(sizeof(*s) + size + 1);
+
+    if (UNLIKELY(!lwan_strbuf_init_with_fixed_buffer(s, s + 1, size))) {
         free(s);
 
         return NULL;
@@ -142,8 +176,10 @@ void lwan_strbuf_free(struct lwan_strbuf *s)
 {
     if (UNLIKELY(!s))
         return;
-    if (s->flags & BUFFER_MALLOCD)
+    if (s->flags & BUFFER_MALLOCD) {
+        assert(!(s->flags & BUFFER_FIXED));
         free(s->buffer);
+    }
     if (s->flags & STRBUF_MALLOCD)
         free(s);
 }
@@ -178,7 +214,7 @@ bool lwan_strbuf_set_static(struct lwan_strbuf *s1, const char *s2, size_t sz)
 
     s1->buffer = (char *)s2;
     s1->used = s1->capacity = sz;
-    s1->flags &= ~BUFFER_MALLOCD;
+    s1->flags &= ~(BUFFER_MALLOCD | BUFFER_FIXED);
 
     return true;
 }
@@ -213,16 +249,26 @@ internal_printf(struct lwan_strbuf *s1,
     return success;
 }
 
+bool lwan_strbuf_vprintf(struct lwan_strbuf *s, const char *fmt, va_list ap)
+{
+    return internal_printf(s, lwan_strbuf_set, fmt, ap);
+}
+
 bool lwan_strbuf_printf(struct lwan_strbuf *s, const char *fmt, ...)
 {
     bool could_printf;
     va_list values;
 
     va_start(values, fmt);
-    could_printf = internal_printf(s, lwan_strbuf_set, fmt, values);
+    could_printf = lwan_strbuf_vprintf(s, fmt, values);
     va_end(values);
 
     return could_printf;
+}
+
+bool lwan_strbuf_append_vprintf(struct lwan_strbuf *s, const char *fmt, va_list ap)
+{
+    return internal_printf(s, lwan_strbuf_append_str, fmt, ap);
 }
 
 bool lwan_strbuf_append_printf(struct lwan_strbuf *s, const char *fmt, ...)
@@ -231,7 +277,7 @@ bool lwan_strbuf_append_printf(struct lwan_strbuf *s, const char *fmt, ...)
     va_list values;
 
     va_start(values, fmt);
-    could_printf = internal_printf(s, lwan_strbuf_append_str, fmt, values);
+    could_printf = lwan_strbuf_append_vprintf(s, fmt, values);
     va_end(values);
 
     return could_printf;
@@ -262,4 +308,34 @@ void lwan_strbuf_reset(struct lwan_strbuf *s)
     }
 
     s->used = 0;
+}
+
+void lwan_strbuf_reset_trim(struct lwan_strbuf *s, size_t trim_thresh)
+{
+    if (s->flags & BUFFER_MALLOCD && s->capacity > trim_thresh) {
+        /* Not using realloc() here because we don't care about the contents
+         * of this buffer after reset is called, but we want to maintain a
+         * buffer already allocated of up to trim_thresh bytes. */
+        void *tmp = malloc(trim_thresh);
+
+        if (tmp) {
+            free(s->buffer);
+            s->buffer = tmp;
+            s->capacity = trim_thresh;
+        }
+    }
+
+    return lwan_strbuf_reset(s);
+}
+
+/* This function is quite dangerous, so the prototype is only in lwan-private.h */
+char *lwan_strbuf_extend_unsafe(struct lwan_strbuf *s, size_t by)
+{
+    if (!lwan_strbuf_grow_by(s, by))
+        return NULL;
+
+    size_t prev_used = s->used;
+    s->used += by;
+
+    return s->buffer + prev_used;
 }

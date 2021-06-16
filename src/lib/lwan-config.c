@@ -39,24 +39,39 @@
 
 #include "ringbuffer.h"
 
-#define FOR_EACH_LEXEME(X)                                                     \
-    X(ERROR) X(STRING) X(EQUAL) X(OPEN_BRACKET) X(CLOSE_BRACKET) X(LINEFEED)   \
-    X(VARIABLE) X(VARIABLE_DEFAULT) X(EOF)
+#define LEX_ERROR(lexer, fmt, ...)                                             \
+    ({                                                                         \
+        config_error(config_from_lexer(lexer), "%s" fmt,                       \
+                     "Syntax error: ", ##__VA_ARGS__);                         \
+        NULL;                                                                  \
+    })
+
+#define PARSER_ERROR(parser, fmt, ...)                                         \
+    ({                                                                         \
+        config_error(config_from_parser(parser), "%s" fmt,                     \
+                     "Parsing error: ", ##__VA_ARGS__);                        \
+        NULL;                                                                  \
+    })
+
+#define INTERNAL_ERROR(parser, fmt, ...)                                       \
+    ({                                                                         \
+        config_error(config_from_parser(parser), "%s" fmt,                     \
+                     "Internal error: ", ##__VA_ARGS__);                       \
+        NULL;                                                                  \
+    })
+
+#define FOR_EACH_LEXEME(X)                                                      \
+    X(STRING) X(EQUAL) X(OPEN_BRACKET) X(CLOSE_BRACKET) X(LINEFEED) X(VARIABLE) \
+    X(VARIABLE_DEFAULT) X(EOF)
 
 #define GENERATE_ENUM(id) LEXEME_ ## id,
-#define GENERATE_ARRAY_ITEM(id) [LEXEME_ ## id] = #id,
 
 enum lexeme_type {
     FOR_EACH_LEXEME(GENERATE_ENUM)
     TOTAL_LEXEMES
 };
 
-static const char *lexeme_type_str[TOTAL_LEXEMES] = {
-    FOR_EACH_LEXEME(GENERATE_ARRAY_ITEM)
-};
-
 #undef GENERATE_ENUM
-#undef GENERATE_ARRAY_ITEM
 
 struct lexeme {
     enum lexeme_type type;
@@ -91,6 +106,7 @@ struct config {
         void *addr;
         size_t sz;
     } mapped;
+    int opened_brackets;
 };
 
 unsigned int parse_time_period(const char *str, unsigned int default_value)
@@ -122,13 +138,16 @@ unsigned int parse_time_period(const char *str, unsigned int default_value)
     return total ? total : default_value;
 }
 
-long parse_long(const char *value, long default_value)
+long long parse_long_long(const char *value, long long default_value)
 {
     char *endptr;
-    long parsed;
+    long long parsed;
+
+    if (!value)
+        return default_value;
 
     errno = 0;
-    parsed = strtol(value, &endptr, 0);
+    parsed = strtoll(value, &endptr, 0);
 
     if (errno != 0)
         return default_value;
@@ -137,6 +156,16 @@ long parse_long(const char *value, long default_value)
         return default_value;
 
     return parsed;
+}
+
+long parse_long(const char *value, long default_value)
+{
+    long long long_long_value = parse_long_long(value, default_value);
+
+    if ((long long)(long)long_long_value != long_long_value)
+        return default_value;
+
+    return (long)long_long_value;
 }
 
 int parse_int(const char *value, int default_value)
@@ -255,9 +284,9 @@ static size_t remaining(struct lexer *lexer)
 static void *lex_config(struct lexer *lexer);
 static void *lex_variable(struct lexer *lexer);
 
-static bool isstring(int chr)
+static bool is_string(int chr)
 {
-    return chr && !isspace(chr) && chr != '=' && chr != '#';
+    return chr && !isspace(chr) && chr != '=' && chr != '#' && chr != '{' && chr != '}';
 }
 
 static void *lex_string(struct lexer *lexer)
@@ -275,7 +304,7 @@ static void *lex_string(struct lexer *lexer)
 
             return lex_variable;
         }
-    } while (isstring(chr));
+    } while (is_string(chr));
 
     backup(lexer);
     emit(lexer, LEXEME_STRING);
@@ -283,19 +312,16 @@ static void *lex_string(struct lexer *lexer)
     return lex_config;
 }
 
-static void *lex_error(struct lexer *lexer, const char *msg)
+static struct config *config_from_parser(struct parser *parser)
 {
-    struct lexeme lexeme = {
-        .type = LEXEME_ERROR,
-        .value = {
-            .value = msg,
-            .len = strlen(msg)
-        }
-    };
+    return container_of(parser, struct config, parser);
+}
 
-    emit_lexeme(lexer, &lexeme);
+static struct config *config_from_lexer(struct lexer *lexer)
+{
+    struct parser *parser = container_of(lexer, struct parser, lexer);
 
-    return NULL;
+    return config_from_parser(parser);
 }
 
 static bool lex_streq(struct lexer *lexer, const char *str, size_t s)
@@ -321,10 +347,10 @@ static void *lex_multiline_string(struct lexer *lexer)
         }
     } while (next(lexer) != '\0');
 
-    return lex_error(lexer, "EOF while scanning multiline string");
+    return LEX_ERROR(lexer, "EOF while scanning multiline string");
 }
 
-static bool isvariable(int chr)
+static bool is_variable(int chr)
 {
     return isalpha(chr) || chr == '_';
 }
@@ -346,7 +372,7 @@ static void *lex_variable_default(struct lexer *lexer)
         }
     } while (chr != '\0');
 
-    return lex_error(lexer, "EOF while scanning for end of variable");
+    return LEX_ERROR(lexer, "EOF while scanning for default value for variable");
 }
 
 static void *lex_variable(struct lexer *lexer)
@@ -372,19 +398,19 @@ static void *lex_variable(struct lexer *lexer)
 
             return lex_config;
         }
-    } while (isvariable(chr));
+    } while (is_variable(chr));
 
-    return lex_error(lexer, "EOF while scanning for end of variable");
+    return LEX_ERROR(lexer, "EOF while scanning for end of variable");
 }
 
-static bool iscomment(int chr)
+static bool is_comment(int chr)
 {
     return chr != '\0' && chr != '\n';
 }
 
 static void *lex_comment(struct lexer *lexer)
 {
-    while (iscomment(next(lexer)))
+    while (is_comment(next(lexer)))
         ;
     backup(lexer);
     return lex_config;
@@ -414,6 +440,12 @@ static void *lex_config(struct lexer *lexer)
         }
 
         if (chr == '}') {
+            /* Emitting a linefeed lexeme before a close bracket lexeme
+             * simplifies the parser and allows for situations where a
+             * section is closed when declaring a key/value pair
+             * (e.g. "section{key=value}" all in a single line).
+             */
+            emit(lexer, LEXEME_LINEFEED);
             emit(lexer, LEXEME_CLOSE_BRACKET);
             return lex_config;
         }
@@ -434,10 +466,10 @@ static void *lex_config(struct lexer *lexer)
         if (chr == '$' && peek(lexer) == '{')
             return lex_variable;
 
-        if (isstring(chr))
+        if (is_string(chr))
             return lex_string;
 
-        return lex_error(lexer, "Invalid character");
+        return LEX_ERROR(lexer, "Invalid character: '%c'", chr);
     }
 
     emit(lexer, LEXEME_LINEFEED);
@@ -461,14 +493,16 @@ static const struct lexeme *lex_next(struct lexer *lexer)
 }
 
 static void *parse_config(struct parser *parser);
+static void *parse_section_end(struct parser *parser);
 
 #define ENV_VAR_NAME_LEN_MAX 64
 
-static __attribute__((noinline)) const char *secure_getenv_len(const char *key, size_t len)
+static __attribute__((noinline)) const char *
+secure_getenv_len(struct parser *parser, const char *key, size_t len)
 {
     if (UNLIKELY(len > ENV_VAR_NAME_LEN_MAX)) {
-        lwan_status_error("Variable name exceeds %d bytes", ENV_VAR_NAME_LEN_MAX);
-        return NULL;
+        return PARSER_ERROR(parser, "Variable name \"%.*s\" exceeds %d bytes",
+                            (int)len, key, ENV_VAR_NAME_LEN_MAX);
     }
 
     return secure_getenv(strndupa(key, len));
@@ -482,6 +516,9 @@ static void *parse_key_value(struct parser *parser)
     size_t key_size;
 
     while ((lexeme = lexeme_ring_buffer_get_ptr_or_null(&parser->buffer))) {
+        if (lexeme->type != LEXEME_STRING)
+            return PARSER_ERROR(parser, "Expecting string");
+
         lwan_strbuf_append_str(&parser->strbuf, lexeme->value.value,
                                lexeme->value.len);
 
@@ -493,45 +530,43 @@ static void *parse_key_value(struct parser *parser)
 
     while ((lexeme = lex_next(&parser->lexer))) {
         switch (lexeme->type) {
-        case LEXEME_VARIABLE_DEFAULT:
         case LEXEME_VARIABLE: {
-            const char *value;
+            const char *value = secure_getenv_len(parser, lexeme->value.value,
+                                                  lexeme->value.len);
+            if (!value) {
+                return PARSER_ERROR(
+                    parser, "Variable '$%.*s' not defined in environment",
+                    (int)lexeme->value.len, lexeme->value.value);
+            }
 
-            value = secure_getenv_len(lexeme->value.value, lexeme->value.len);
-            if (lexeme->type == LEXEME_VARIABLE) {
-                if (!value) {
-                    lwan_status_error(
-                        "Variable '$%.*s' not defined in environment",
-                        (int)lexeme->value.len, lexeme->value.value);
-                    return NULL;
-                } else {
-                    lwan_strbuf_append_strz(&parser->strbuf, value);
-                }
+            lwan_strbuf_append_strz(&parser->strbuf, value);
+
+            break;
+        }
+
+        case LEXEME_VARIABLE_DEFAULT: {
+            const char *value = secure_getenv_len(parser, lexeme->value.value,
+                                                  lexeme->value.len);
+            const struct lexeme *var_name = lexeme;
+
+            if (!(lexeme = lex_next(&parser->lexer))) {
+                return PARSER_ERROR(
+                    parser, "Default value for variable '$%.*s' not given",
+                    (int)var_name->value.len, var_name->value.value);
+            }
+
+            if (lexeme->type != LEXEME_STRING)
+                return PARSER_ERROR(parser, "Wrong format for default value");
+
+            if (!value) {
+                lwan_status_debug(
+                    "Using default value of '%.*s' for variable '${%.*s}'",
+                    (int)lexeme->value.len, lexeme->value.value,
+                    (int)var_name->value.len, var_name->value.value);
+                lwan_strbuf_append_str(&parser->strbuf, lexeme->value.value,
+                                       lexeme->value.len);
             } else {
-                const struct lexeme *var_name = lexeme;
-
-                if (!(lexeme = lex_next(&parser->lexer))) {
-                    lwan_status_error(
-                        "Default value for variable '$%.*s' not given",
-                        (int)var_name->value.len, var_name->value.value);
-                    return NULL;
-                }
-
-                if (lexeme->type != LEXEME_STRING) {
-                    lwan_status_error("Wrong format for default value");
-                    return NULL;
-                }
-
-                if (!value) {
-                    lwan_status_debug(
-                        "Using default value of '%.*s' for variable '${%.*s}'",
-                        (int)lexeme->value.len, lexeme->value.value,
-                        (int)var_name->value.len, var_name->value.value);
-                    lwan_strbuf_append_str(&parser->strbuf, lexeme->value.value,
-                                           lexeme->value.len);
-                } else {
-                    lwan_strbuf_append_strz(&parser->strbuf, value);
-                }
+                lwan_strbuf_append_strz(&parser->strbuf, value);
             }
 
             break;
@@ -550,28 +585,35 @@ static void *parse_key_value(struct parser *parser)
 
             break;
 
-        case LEXEME_CLOSE_BRACKET:
-            backup(&parser->lexer);
-            /* fallthrough */
-
         case LEXEME_LINEFEED:
             line.key = lwan_strbuf_get_buffer(&parser->strbuf);
             line.value = line.key + key_size + 1;
-            return config_ring_buffer_try_put(&parser->items, &line)
-                       ? parse_config
-                       : NULL;
 
-        default:
-            lwan_status_error("Unexpected token while parsing key-value: %s",
-                              lexeme_type_str[lexeme->type]);
-            return NULL;
+            if (config_ring_buffer_try_put(&parser->items, &line))
+                return parse_config;
+
+            return PARSER_ERROR(parser,
+                                "Could not add key/value to ring buffer");
+
+        case LEXEME_OPEN_BRACKET:
+            return PARSER_ERROR(parser, "Open bracket not expected here");
+
+        case LEXEME_CLOSE_BRACKET:
+            return INTERNAL_ERROR(
+                parser, "Close bracket found while parsing key/value");
+
+        case LEXEME_EOF:
+            return INTERNAL_ERROR(
+                parser, "EOF found while parsing key/value");
+
+        case TOTAL_LEXEMES:
+            __builtin_unreachable();
         }
 
         last_lexeme = lexeme->type;
     }
 
-    lwan_status_error("EOF while parsing key-value");
-    return NULL;
+    return PARSER_ERROR(parser, "EOF while parsing key-value");
 }
 
 static void *parse_section(struct parser *parser)
@@ -579,8 +621,9 @@ static void *parse_section(struct parser *parser)
     const struct lexeme *lexeme;
     size_t name_len;
 
-    if (!(lexeme = lexeme_ring_buffer_get_ptr_or_null(&parser->buffer)))
-        return NULL;
+    lexeme = lexeme_ring_buffer_get_ptr_or_null(&parser->buffer);
+    if (!lexeme || lexeme->type != LEXEME_STRING)
+        return PARSER_ERROR(parser, "Expecting a string");
 
     lwan_strbuf_append_str(&parser->strbuf, lexeme->value.value,
                            lexeme->value.len);
@@ -588,6 +631,9 @@ static void *parse_section(struct parser *parser)
     lwan_strbuf_append_char(&parser->strbuf, '\0');
 
     while ((lexeme = lexeme_ring_buffer_get_ptr_or_null(&parser->buffer))) {
+        if (lexeme->type != LEXEME_STRING)
+            return PARSER_ERROR(parser, "Expecting a string");
+
         lwan_strbuf_append_str(&parser->strbuf, lexeme->value.value,
                                lexeme->value.len);
 
@@ -613,23 +659,57 @@ static void *parse_section_shorthand(struct parser *parser)
 
         if (config_ring_buffer_try_put(&parser->items, &line))
             return next_state;
+
+        return INTERNAL_ERROR(parser, "couldn't append line to internal ring buffer");
     }
 
     return NULL;
 }
 
+static void *parse_section_end(struct parser *parser)
+{
+    struct config_line line = {.type = CONFIG_LINE_TYPE_SECTION_END};
+    struct config *config = config_from_parser(parser);
+
+    if (!config->opened_brackets)
+        return PARSER_ERROR(parser, "Section closed before it opened");
+
+    if (!lexeme_ring_buffer_empty(&parser->buffer))
+        return PARSER_ERROR(parser, "Not expecting a close bracket here");
+
+    if (!config_ring_buffer_try_put(&parser->items, &line)) {
+        return INTERNAL_ERROR(parser,
+                              "could not store section end in ring buffer");
+    }
+
+    config->opened_brackets--;
+
+    return parse_config;
+}
+
 static void *parse_config(struct parser *parser)
 {
-    const struct lexeme *lexeme;
+    const struct lexeme *lexeme = lex_next(&parser->lexer);
 
-    if (!(lexeme = lex_next(&parser->lexer)))
-        return NULL;
+    if (!lexeme) {
+        /* EOF is signaled by a LEXEME_EOF from the parser, so
+         * this should never happen. */
+        return INTERNAL_ERROR(parser, "could not obtain lexeme");
+    }
 
     switch (lexeme->type) {
     case LEXEME_EQUAL:
+        if (lexeme_ring_buffer_empty(&parser->buffer))
+            return PARSER_ERROR(parser, "Keys can´t be empty");
+
         return parse_key_value;
 
     case LEXEME_OPEN_BRACKET:
+        if (lexeme_ring_buffer_empty(&parser->buffer))
+            return PARSER_ERROR(parser, "Section names can´t be empty");
+
+        config_from_parser(parser)->opened_brackets++;
+
         return parse_section;
 
     case LEXEME_LINEFEED:
@@ -639,28 +719,33 @@ static void *parse_config(struct parser *parser)
         return parse_config;
 
     case LEXEME_STRING:
-        lexeme_ring_buffer_try_put(&parser->buffer, lexeme);
+        if (!lexeme_ring_buffer_try_put(&parser->buffer, lexeme))
+            return INTERNAL_ERROR(parser, "could not store string in ring buffer");
 
         return parse_config;
 
-    case LEXEME_CLOSE_BRACKET: {
-        struct config_line line = { .type = CONFIG_LINE_TYPE_SECTION_END };
-
-        if (config_ring_buffer_try_put(&parser->items, &line))
-            return parse_config;
-
-        lwan_status_error("Could not parse section end");
-        return NULL;
-    }
+    case LEXEME_CLOSE_BRACKET:
+        return parse_section_end;
 
     case LEXEME_EOF:
-        return NULL;
+        if (config_from_parser(parser)->opened_brackets)
+            return PARSER_ERROR(parser, "EOF while looking for a close bracket");
 
-    default:
-        lwan_status_error("Unexpected lexeme type: %s",
-            lexeme_type_str[lexeme->type]);
-        return NULL;
+        if (!lexeme_ring_buffer_empty(&parser->buffer))
+            return INTERNAL_ERROR(parser, "premature EOF");
+
+        break;
+
+    case LEXEME_VARIABLE:
+    case LEXEME_VARIABLE_DEFAULT:
+        return PARSER_ERROR(parser, "Variable '%.*s' can't be used here",
+                            (int)lexeme->value.len, lexeme->value.value);
+
+    case TOTAL_LEXEMES:
+        __builtin_unreachable();
     }
+
+    return NULL;
 }
 
 static const struct config_line *parser_next(struct parser *parser)
@@ -698,7 +783,7 @@ config_open_path(const char *path, void **data, size_t *size)
         return NULL;
     }
 
-    mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
     if (mapped == MAP_FAILED)
         return NULL;
@@ -731,6 +816,7 @@ config_init_data(struct config *config, const void *data, size_t len)
     };
 
     config->error_message = NULL;
+    config->opened_brackets = 0;
 
     lwan_strbuf_init(&config->parser.strbuf);
     config_ring_buffer_init(&config->parser.items);
@@ -826,6 +912,7 @@ struct config *config_isolate_section(struct config *current_conf,
 
     isolated->mapped.addr = NULL;
     isolated->mapped.sz = 0;
+    /* Keep opened_brackets from the original */
 
     lexer = &isolated->parser.lexer;
     lexer->start = lexer->pos;

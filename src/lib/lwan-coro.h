@@ -27,9 +27,11 @@
 typedef uintptr_t coro_context[10];
 #elif defined(__i386__)
 typedef uintptr_t coro_context[7];
+#elif defined(HAVE_LIBUCONTEXT)
+#include <libucontext/libucontext.h>
+typedef libucontext_ucontext_t coro_context;
 #else
-#include <ucontext.h>
-typedef ucontext_t coro_context;
+#error Unsupported platform.
 #endif
 
 struct coro;

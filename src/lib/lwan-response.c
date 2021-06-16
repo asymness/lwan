@@ -95,39 +95,6 @@ void lwan_response_shutdown(struct lwan *l __attribute__((unused)))
     lwan_tpl_free(error_template);
 }
 
-#ifndef NDEBUG
-static const char *get_request_method(struct lwan_request *request)
-{
-#define GENERATE_CASE_STMT(upper, lower, mask, constant)                       \
-    case REQUEST_METHOD_##upper:                                               \
-        return #upper;
-
-    switch (lwan_request_get_method(request)) {
-        FOR_EACH_REQUEST_METHOD(GENERATE_CASE_STMT)
-    default:
-        return "UNKNOWN";
-    }
-
-#undef GENERATE_CASE_STMT
-}
-
-static void log_request(struct lwan_request *request,
-                        enum lwan_http_status status)
-{
-    char ip_buffer[INET6_ADDRSTRLEN];
-
-    lwan_status_debug("%s [%s] \"%s %s HTTP/%s\" %d %s",
-                      lwan_request_get_remote_address(request, ip_buffer),
-                      request->conn->thread->date.date,
-                      get_request_method(request), request->original_url.value,
-                      request->flags & REQUEST_IS_HTTP_1_0 ? "1.0" : "1.1",
-                      status, request->response.mime_type);
-}
-#else
-#define log_request(...)
-#endif
-#include <stdlib.h>
-
 static inline bool has_response_body(enum lwan_request_flags method,
                                      enum lwan_http_status status)
 {
@@ -144,7 +111,6 @@ void lwan_response(struct lwan_request *request, enum lwan_http_status status)
         /* Send last, 0-sized chunk */
         lwan_strbuf_reset(response->buffer);
         lwan_response_send_chunk(request);
-        log_request(request, status);
         return;
     }
 
@@ -158,8 +124,6 @@ void lwan_response(struct lwan_request *request, enum lwan_http_status status)
            just be handled by lwan_default_response().  */
         return lwan_default_response(request, status);
     }
-
-    log_request(request, status);
 
     if (request->flags & RESPONSE_STREAM) {
         if (LIKELY(response->stream.callback)) {
@@ -202,18 +166,23 @@ void lwan_response(struct lwan_request *request, enum lwan_http_status status)
     return (void)lwan_writev(request, response_vec, N_ELEMENTS(response_vec));
 }
 
+void lwan_fill_default_response(struct lwan_strbuf *buffer,
+                                enum lwan_http_status status)
+{
+    lwan_tpl_apply_with_buffer(
+        error_template, buffer,
+        &(struct error_template){
+            .short_message = lwan_http_status_as_string(status),
+            .long_message = lwan_http_status_as_descriptive_string(status),
+        });
+}
+
 void lwan_default_response(struct lwan_request *request,
                            enum lwan_http_status status)
 {
     request->response.mime_type = "text/html";
 
-    lwan_tpl_apply_with_buffer(
-        error_template, request->response.buffer,
-        &(struct error_template){
-            .short_message = lwan_http_status_as_string(status),
-            .long_message = lwan_http_status_as_descriptive_string(status),
-        });
-
+    lwan_fill_default_response(request->response.buffer, status);
     lwan_response(request, status);
 }
 
@@ -252,6 +221,19 @@ void lwan_default_response(struct lwan_request *request,
 #define APPEND_CONSTANT(const_str_)                                            \
     APPEND_STRING_LEN((const_str_), sizeof(const_str_) - 1)
 
+static ALWAYS_INLINE __attribute__((const)) bool
+has_content_length(enum lwan_request_flags v)
+{
+    return !(v & (RESPONSE_NO_CONTENT_LENGTH | RESPONSE_STREAM |
+                  RESPONSE_CHUNKED_ENCODING));
+}
+
+static ALWAYS_INLINE __attribute__((const)) bool
+has_uncommon_response_headers(enum lwan_request_flags v)
+{
+    return v & (RESPONSE_INCLUDE_REQUEST_ID | REQUEST_ALLOW_CORS | RESPONSE_CHUNKED_ENCODING);
+}
+
 size_t lwan_prepare_response_header_full(
     struct lwan_request *request,
     enum lwan_http_status status,
@@ -259,50 +241,46 @@ size_t lwan_prepare_response_header_full(
     size_t headers_buf_size,
     const struct lwan_key_value *additional_headers)
 {
-    /* NOTE: If new response headers are added here, update can_override_header()
-     *       in lwan.c */
+    /* NOTE: If new response headers are added here, update
+     * can_override_header() in lwan.c */
 
     char *p_headers;
     char *p_headers_end = headers + headers_buf_size;
     char buffer[INT_TO_STR_BUFFER_SIZE];
-    bool date_overridden = false;
-    bool expires_overridden = false;
+    const enum lwan_request_flags request_flags = request->flags;
+    const enum lwan_connection_flags conn_flags = request->conn->flags;
+    bool expires_override = !!(request->flags & RESPONSE_NO_EXPIRES);
 
     assert(request->global_response_headers);
 
     p_headers = headers;
 
-    if (UNLIKELY(request->flags & REQUEST_IS_HTTP_1_0))
+    if (UNLIKELY(request_flags & REQUEST_IS_HTTP_1_0))
         APPEND_CONSTANT("HTTP/1.0 ");
     else
         APPEND_CONSTANT("HTTP/1.1 ");
     APPEND_STRING(lwan_http_status_as_string_with_code(status));
 
-    if (UNLIKELY(request->flags & RESPONSE_CHUNKED_ENCODING)) {
-        APPEND_CONSTANT("\r\nTransfer-Encoding: chunked");
-    } else if (UNLIKELY(request->flags & RESPONSE_NO_CONTENT_LENGTH)) {
-        /* Do nothing. */
-    } else if (!(request->flags & RESPONSE_STREAM)) {
-        APPEND_CONSTANT("\r\nContent-Length: ");
-        APPEND_UINT(lwan_strbuf_get_length(request->response.buffer));
-    }
+    if (LIKELY(!additional_headers))
+        goto skip_additional_headers;
 
-    if (LIKELY((status < HTTP_BAD_REQUEST && additional_headers))) {
+    if (LIKELY((status < HTTP_CLASS__CLIENT_ERROR))) {
         const struct lwan_key_value *header;
+        bool date_override = false;
 
         for (header = additional_headers; header->key; header++) {
-            STRING_SWITCH_L(header->key) {
+            STRING_SWITCH_L (header->key) {
             case STR4_INT_L('S', 'e', 'r', 'v'):
                 if (LIKELY(streq(header->key + 4, "er")))
                     continue;
                 break;
             case STR4_INT_L('D', 'a', 't', 'e'):
                 if (LIKELY(*(header->key + 4) == '\0'))
-                    date_overridden = true;
+                    date_override = true;
                 break;
             case STR4_INT_L('E', 'x', 'p', 'i'):
                 if (LIKELY(streq(header->key + 4, "res")))
-                    expires_overridden = true;
+                    expires_override = true;
                 break;
             }
 
@@ -314,6 +292,9 @@ size_t lwan_prepare_response_header_full(
             APPEND_CHAR_NOCHECK(' ');
             APPEND_STRING(header->value);
         }
+
+        if (date_override)
+            goto skip_date_header;
     } else if (UNLIKELY(status == HTTP_NOT_AUTHORIZED)) {
         const struct lwan_key_value *header;
 
@@ -326,37 +307,58 @@ size_t lwan_prepare_response_header_full(
         }
     }
 
-    if (UNLIKELY(request->conn->flags & CONN_IS_UPGRADE)) {
+skip_additional_headers:
+    APPEND_CONSTANT("\r\nDate: ");
+    APPEND_STRING_LEN(request->conn->thread->date.date, 29);
+
+skip_date_header:
+    if (UNLIKELY(conn_flags & CONN_IS_UPGRADE)) {
         APPEND_CONSTANT("\r\nConnection: Upgrade");
     } else {
-        if (LIKELY(request->conn->flags & CONN_IS_KEEP_ALIVE)) {
-            APPEND_CONSTANT("\r\nConnection: keep-alive");
-        } else {
-            APPEND_CONSTANT("\r\nConnection: close");
+        if (!(conn_flags & CONN_SENT_CONNECTION_HEADER)) {
+            if (LIKELY(conn_flags & CONN_IS_KEEP_ALIVE))
+                APPEND_CONSTANT("\r\nConnection: keep-alive");
+            else
+                APPEND_CONSTANT("\r\nConnection: close");
+            request->conn->flags |= CONN_SENT_CONNECTION_HEADER;
         }
 
         if (LIKELY(request->response.mime_type)) {
             APPEND_CONSTANT("\r\nContent-Type: ");
             APPEND_STRING(request->response.mime_type);
         }
+
+        if (!expires_override) {
+            APPEND_CONSTANT("\r\nExpires: ");
+            APPEND_STRING_LEN(request->conn->thread->date.expires, 29);
+        }
     }
 
-    if (LIKELY(!date_overridden)) {
-        APPEND_CONSTANT("\r\nDate: ");
-        APPEND_STRING_LEN(request->conn->thread->date.date, 29);
+    if (LIKELY(has_content_length(request_flags))) {
+        APPEND_CONSTANT("\r\nContent-Length: ");
+        APPEND_UINT(lwan_strbuf_get_length(request->response.buffer));
     }
-
-    if (LIKELY(!expires_overridden)) {
-        APPEND_CONSTANT("\r\nExpires: ");
-        APPEND_STRING_LEN(request->conn->thread->date.expires, 29);
-    }
-
-    if (UNLIKELY(request->flags & REQUEST_ALLOW_CORS)) {
-        APPEND_CONSTANT(
-            "\r\nAccess-Control-Allow-Origin: *"
-            "\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS"
-            "\r\nAccess-Control-Allow-Credentials: true"
-            "\r\nAccess-Control-Allow-Headers: Origin, Accept, Content-Type, Authorization");
+    if (UNLIKELY(has_uncommon_response_headers(request_flags))) {
+        if (request_flags & REQUEST_ALLOW_CORS) {
+            APPEND_CONSTANT(
+                "\r\nAccess-Control-Allow-Origin: *"
+                "\r\nAccess-Control-Allow-Methods: GET, POST, PUT, OPTIONS"
+                "\r\nAccess-Control-Allow-Credentials: true"
+                "\r\nAccess-Control-Allow-Headers: Origin, Accept, "
+                "Content-Type");
+        }
+        if (request_flags & RESPONSE_CHUNKED_ENCODING &&
+            !has_content_length(request_flags)) {
+            APPEND_CONSTANT("\r\nTransfer-Encoding: chunked");
+        }
+        if (request_flags & RESPONSE_INCLUDE_REQUEST_ID) {
+            char request_id[] = "fill-with-req-id";
+            APPEND_CONSTANT("\r\nX-Request-Id: ");
+            int r = snprintf(request_id, sizeof(request_id), "%016lx", request->request_id);
+            if (UNLIKELY(r < 0 || r >= (int)sizeof(request_id)))
+                return 0;
+            APPEND_STRING_LEN(request_id, (size_t)r);
+        }
     }
 
     APPEND_STRING_LEN(lwan_strbuf_get_buffer(request->global_response_headers),

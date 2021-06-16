@@ -31,13 +31,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#if defined(HAVE_EVENTFD)
-#include <sys/eventfd.h>
+#if defined(HAVE_SO_ATTACH_REUSEPORT_CBPF)
+#include <linux/filter.h>
 #endif
 
+#include "list.h"
+#include "murmur3.h"
 #include "lwan-private.h"
 #include "lwan-tq.h"
-#include "list.h"
 
 static void lwan_strbuf_free_defer(void *data)
 {
@@ -71,7 +72,7 @@ static void graceful_close(struct lwan *l,
     }
 
     for (int tries = 0; tries < 20; tries++) {
-        ssize_t r = read(fd, buffer, DEFAULT_BUFFER_SIZE);
+        ssize_t r = recv(fd, buffer, DEFAULT_BUFFER_SIZE, 0);
 
         if (!r)
             break;
@@ -79,8 +80,7 @@ static void graceful_close(struct lwan *l,
         if (r < 0) {
             switch (errno) {
             case EAGAIN:
-                coro_yield(conn->coro, CONN_CORO_WANT_READ);
-                /* Fallthrough */
+                break;
             case EINTR:
                 continue;
             default:
@@ -88,11 +88,44 @@ static void graceful_close(struct lwan *l,
             }
         }
 
-        coro_yield(conn->coro, CONN_CORO_YIELD);
+        coro_yield(conn->coro, CONN_CORO_WANT_READ);
     }
 
     /* close(2) will be called when the coroutine yields with CONN_CORO_ABORT */
 }
+
+#if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
+static void lwan_random_seed_prng_for_thread(const struct lwan_thread *t)
+{
+    (void)t;
+}
+
+uint64_t lwan_random_uint64()
+{
+    static uint64_t value;
+
+    return ATOMIC_INC(value);
+}
+#else
+static __thread __uint128_t lehmer64_state;
+
+static void lwan_random_seed_prng_for_thread(const struct lwan_thread *t)
+{
+    if (lwan_getentropy(&lehmer64_state, sizeof(lehmer64_state), 0) < 0) {
+        lwan_status_warning("Couldn't get proper entropy for PRNG, using fallback seed");
+        lehmer64_state |= murmur3_fmix64((uint64_t)(uintptr_t)t);
+        lehmer64_state <<= 64;
+        lehmer64_state |= murmur3_fmix64((uint64_t)t->epoll_fd);
+    }
+}
+
+uint64_t lwan_random_uint64()
+{
+    /* https://lemire.me/blog/2019/03/19/the-fastest-conventional-random-number-generator-that-can-pass-big-crush/ */
+    lehmer64_state *= 0xda942042e4dd58b5ull;
+    return (uint64_t)(lehmer64_state >> 64);
+}
+#endif
 
 __attribute__((noreturn)) static int process_request_coro(struct coro *coro,
                                                           void *data)
@@ -108,7 +141,9 @@ __attribute__((noreturn)) static int process_request_coro(struct coro *coro,
     char request_buffer[DEFAULT_BUFFER_SIZE];
     struct lwan_value buffer = {.value = request_buffer, .len = 0};
     char *next_request = NULL;
+    char *header_start[N_HEADER_START];
     struct lwan_proxy proxy;
+    const int error_when_n_packets = lwan_calculate_n_packets(DEFAULT_BUFFER_SIZE);
 
     coro_defer(coro, lwan_strbuf_free_defer, &strbuf);
 
@@ -116,47 +151,55 @@ __attribute__((noreturn)) static int process_request_coro(struct coro *coro,
     assert(init_gen == coro_deferred_get_generation(coro));
 
     while (true) {
+        struct lwan_request_parser_helper helper = {
+            .buffer = &buffer,
+            .next_request = next_request,
+            .error_when_n_packets = error_when_n_packets,
+            .header_start = header_start,
+        };
         struct lwan_request request = {.conn = conn,
                                        .global_response_headers = &lwan->headers,
                                        .fd = fd,
+                                       .request_id = lwan_random_uint64(),
                                        .response = {.buffer = &strbuf},
                                        .flags = flags,
-                                       .proxy = &proxy};
+                                       .proxy = &proxy,
+                                       .helper = &helper};
 
-        next_request =
-            lwan_process_request(lwan, &request, &buffer, next_request);
+        lwan_process_request(lwan, &request);
 
-        if (coro_deferred_get_generation(coro) > ((2 * LWAN_ARRAY_INCREMENT) / 3)) {
-            /* Batch execution of coro_defers() up to 2/3 LWAN_ARRAY_INCREMENT times,
-             * to avoid moving deferred array to heap in most cases.  (This is to give
-             * some slack to the next request being processed by this coro.) */
-            coro_deferred_run(coro, init_gen);
-        }
+        /* Run the deferred instructions now (except those used to initialize
+         * the coroutine), so that if the connection is gracefully closed,
+         * the storage for ``helper'' is still there. */
+        coro_deferred_run(coro, init_gen);
 
-        if (LIKELY(conn->flags & CONN_IS_KEEP_ALIVE)) {
-            if (next_request && *next_request) {
-                conn->flags |= CONN_CORK;
-                coro_yield(coro, CONN_CORO_WANT_WRITE);
-            } else {
-                conn->flags &= ~CONN_CORK;
-                coro_yield(coro, CONN_CORO_WANT_READ);
-            }
-        } else {
+        if (UNLIKELY(!(conn->flags & CONN_IS_KEEP_ALIVE))) {
             graceful_close(lwan, conn, request_buffer);
             break;
         }
 
-        lwan_strbuf_reset(&strbuf);
+        if (next_request && *next_request) {
+            conn->flags |= CONN_CORK;
+
+            if (!(conn->flags & CONN_EVENTS_WRITE))
+                coro_yield(coro, CONN_CORO_WANT_WRITE);
+        } else {
+            conn->flags &= ~CONN_CORK;
+            coro_yield(coro, CONN_CORO_WANT_READ);
+        }
+
+        /* Ensure string buffer is reset between requests, and that the backing
+         * store isn't over 2KB. */
+        lwan_strbuf_reset_trim(&strbuf, 2048);
 
         /* Only allow flags from config. */
         flags = request.flags & (REQUEST_PROXIED | REQUEST_ALLOW_CORS);
+        next_request = helper.next_request;
     }
 
     coro_yield(coro, CONN_CORO_ABORT);
     __builtin_unreachable();
 }
-
-#undef REQUEST_FLAG
 
 static ALWAYS_INLINE uint32_t
 conn_flags_to_epoll_events(enum lwan_connection_flags flags)
@@ -187,8 +230,7 @@ static void update_epoll_flags(int fd,
          * or EPOLLOUT events.  We still want to track this fd in epoll, though,
          * so unset both so that only EPOLLRDHUP (plus the implicitly-set ones)
          * are set. */
-        [CONN_CORO_SUSPEND_TIMER] = CONN_SUSPENDED_TIMER,
-        [CONN_CORO_SUSPEND_ASYNC_AWAIT] = CONN_SUSPENDED_ASYNC_AWAIT,
+        [CONN_CORO_SUSPEND] = CONN_SUSPENDED,
 
         /* Ideally, when suspending a coroutine, the current flags&CONN_EVENTS_MASK
          * would have to be stored and restored -- however, resuming as if the
@@ -206,8 +248,7 @@ static void update_epoll_flags(int fd,
         [CONN_CORO_WANT_READ] = ~CONN_EVENTS_WRITE,
         [CONN_CORO_WANT_WRITE] = ~CONN_EVENTS_READ,
 
-        [CONN_CORO_SUSPEND_TIMER] = ~(CONN_EVENTS_READ_WRITE | CONN_SUSPENDED_ASYNC_AWAIT),
-        [CONN_CORO_SUSPEND_ASYNC_AWAIT] = ~(CONN_EVENTS_READ_WRITE | CONN_SUSPENDED_TIMER),
+        [CONN_CORO_SUSPEND] = ~CONN_EVENTS_READ_WRITE,
         [CONN_CORO_RESUME] = ~CONN_SUSPENDED,
     };
     enum lwan_connection_flags prev_flags = conn->flags;
@@ -259,7 +300,7 @@ resume_async(struct timeout_queue *tq,
     struct lwan_connection *await_fd_conn = &tq->lwan->conns[await_fd];
     if (LIKELY(await_fd_conn->flags & CONN_ASYNC_AWAIT)) {
         if (LIKELY((await_fd_conn->flags & CONN_EVENTS_MASK) == flags))
-            return CONN_CORO_SUSPEND_ASYNC_AWAIT;
+            return CONN_CORO_SUSPEND;
 
         op = EPOLL_CTL_MOD;
     } else {
@@ -273,7 +314,7 @@ resume_async(struct timeout_queue *tq,
     if (LIKELY(!epoll_ctl(epoll_fd, op, await_fd, &event))) {
         await_fd_conn->flags &= ~CONN_EVENTS_MASK;
         await_fd_conn->flags |= flags;
-        return CONN_CORO_SUSPEND_ASYNC_AWAIT;
+        return CONN_CORO_SUSPEND;
     }
 
     return CONN_CORO_ABORT;
@@ -307,60 +348,101 @@ static void update_date_cache(struct lwan_thread *thread)
                          thread->date.expires);
 }
 
-static ALWAYS_INLINE void spawn_coro(struct lwan_connection *conn,
+static bool send_buffer_without_coro(int fd, const char *buf, size_t buf_len, int flags)
+{
+    size_t total_sent = 0;
+
+    for (int try = 0; try < 10; try++) {
+        size_t to_send = buf_len - total_sent;
+        if (!to_send)
+            return true;
+
+        ssize_t sent = send(fd, buf + total_sent, to_send, flags);
+        if (sent <= 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN)
+                continue;
+            break;
+        }
+
+        total_sent += (size_t)sent;
+    }
+
+    return false;
+}
+
+static bool send_string_without_coro(int fd, const char *str, int flags)
+{
+    return send_buffer_without_coro(fd, str, strlen(str), flags);
+}
+
+static void send_response_without_coro(const struct lwan *l,
+                                       int fd,
+                                       enum lwan_http_status status)
+{
+    if (!send_string_without_coro(fd, "HTTP/1.0 ", MSG_MORE))
+        return;
+
+    if (!send_string_without_coro(
+            fd, lwan_http_status_as_string_with_code(status), MSG_MORE))
+        return;
+
+    if (!send_string_without_coro(fd, "\r\nConnection: close", MSG_MORE))
+        return;
+
+    if (!send_string_without_coro(fd, "\r\nContent-Type: text/html", MSG_MORE))
+        return;
+
+    if (send_buffer_without_coro(fd, lwan_strbuf_get_buffer(&l->headers),
+                                 lwan_strbuf_get_length(&l->headers),
+                                 MSG_MORE)) {
+        struct lwan_strbuf buffer;
+
+        lwan_strbuf_init(&buffer);
+        lwan_fill_default_response(&buffer, status);
+
+        send_buffer_without_coro(fd, lwan_strbuf_get_buffer(&buffer),
+                                 lwan_strbuf_get_length(&buffer), 0);
+
+        lwan_strbuf_free(&buffer);
+    }
+}
+
+static ALWAYS_INLINE bool spawn_coro(struct lwan_connection *conn,
                                      struct coro_switcher *switcher,
                                      struct timeout_queue *tq)
 {
     struct lwan_thread *t = conn->thread;
 
     assert(!conn->coro);
+    assert(!(conn->flags & CONN_ASYNC_AWAIT));
     assert(t);
     assert((uintptr_t)t >= (uintptr_t)tq->lwan->thread.threads);
     assert((uintptr_t)t <
            (uintptr_t)(tq->lwan->thread.threads + tq->lwan->thread.count));
 
-    *conn = (struct lwan_connection) {
+    *conn = (struct lwan_connection){
         .coro = coro_new(switcher, process_request_coro, conn),
         .flags = CONN_EVENTS_READ,
         .time_to_expire = tq->current_time + tq->move_to_last_bump,
         .thread = t,
     };
-    if (UNLIKELY(!conn->coro)) {
-        conn->flags = 0;
-        lwan_status_error("Could not create coroutine");
-        return;
+    if (LIKELY(conn->coro)) {
+        timeout_queue_insert(tq, conn);
+        return true;
     }
 
-    timeout_queue_insert(tq, conn);
-}
+    conn->flags = 0;
 
-static void accept_nudge(int pipe_fd,
-                         struct lwan_thread *t,
-                         struct lwan_connection *conns,
-                         struct timeout_queue *tq,
-                         struct coro_switcher *switcher,
-                         int epoll_fd)
-{
-    uint64_t event;
-    int new_fd;
+    int fd = lwan_connection_get_fd(tq->lwan, conn);
 
-    /* Errors are ignored here as pipe_fd serves just as a way to wake the
-     * thread from epoll_wait().  It's fine to consume the queue at this
-     * point, regardless of the error type. */
-    (void)read(pipe_fd, &event, sizeof(event));
+    lwan_status_error("Couldn't spawn coroutine for file descriptor %d", fd);
 
-    while (spsc_queue_pop(&t->pending_fds, &new_fd)) {
-        struct lwan_connection *conn = &conns[new_fd];
-        struct epoll_event ev = {
-            .data.ptr = conn,
-            .events = conn_flags_to_epoll_events(CONN_EVENTS_READ),
-        };
-
-        if (LIKELY(!epoll_ctl(epoll_fd, EPOLL_CTL_ADD, new_fd, &ev)))
-            spawn_coro(conn, switcher, tq);
-    }
-
-    timeouts_add(t->wheel, &tq->timeout, 1000);
+    send_response_without_coro(tq->lwan, fd, HTTP_UNAVAILABLE);
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+    return false;
 }
 
 static bool process_pending_timers(struct timeout_queue *tq,
@@ -405,6 +487,7 @@ static bool process_pending_timers(struct timeout_queue *tq,
 static int
 turn_timer_wheel(struct timeout_queue *tq, struct lwan_thread *t, int epoll_fd)
 {
+    const int infinite_timeout = -1;
     timeout_t wheel_timeout;
     struct timespec now;
 
@@ -414,30 +497,120 @@ turn_timer_wheel(struct timeout_queue *tq, struct lwan_thread *t, int epoll_fd)
     timeouts_update(t->wheel,
                     (timeout_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000));
 
+    /* Check if there's an expired timer. */
     wheel_timeout = timeouts_timeout(t->wheel);
-    if (UNLIKELY((int64_t)wheel_timeout < 0))
-        goto infinite_timeout;
-
-    if (wheel_timeout == 0) {
-        if (!process_pending_timers(tq, t, epoll_fd))
-            goto infinite_timeout;
-
-        wheel_timeout = timeouts_timeout(t->wheel);
-        if (wheel_timeout == 0)
-            goto infinite_timeout;
+    if (wheel_timeout > 0) {
+        return (int)wheel_timeout; /* No, but will soon. Wake us up in
+                                      wheel_timeout ms. */
     }
 
-    return (int)wheel_timeout;
+    if (UNLIKELY((int64_t)wheel_timeout < 0))
+        return infinite_timeout; /* None found. */
 
-infinite_timeout:
-    return -1;
+    if (!process_pending_timers(tq, t, epoll_fd))
+        return infinite_timeout; /* No more timers to process. */
+
+    /* After processing pending timers, determine when to wake up. */
+    return (int)timeouts_timeout(t->wheel);
+}
+
+static bool accept_waiting_clients(const struct lwan_thread *t)
+{
+    const struct lwan_connection *conns = t->lwan->conns;
+
+    while (true) {
+        int fd =
+            accept4(t->listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+
+        if (LIKELY(fd >= 0)) {
+            const struct lwan_connection *conn = &conns[fd];
+            struct epoll_event ev = {
+                .data.ptr = (void *)conn,
+                .events = conn_flags_to_epoll_events(CONN_EVENTS_READ),
+            };
+            int r = epoll_ctl(conn->thread->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+
+            if (UNLIKELY(r < 0)) {
+                lwan_status_perror("Could not add file descriptor %d to epoll "
+                                   "set %d. Dropping connection",
+                                   fd, conn->thread->epoll_fd);
+
+                send_response_without_coro(t->lwan, fd, HTTP_UNAVAILABLE);
+                shutdown(fd, SHUT_RDWR);
+                close(fd);
+            }
+
+            continue;
+        }
+
+        switch (errno) {
+        default:
+            lwan_status_perror("Unexpected error while accepting connections");
+            /* fallthrough */
+
+        case EAGAIN:
+            return true;
+
+        case EBADF:
+        case ECONNABORTED:
+        case EINVAL:
+            lwan_status_info("Listening socket closed");
+            return false;
+        }
+    }
+
+    __builtin_unreachable();
+}
+
+static int create_listen_socket(struct lwan_thread *t,
+                                unsigned int num)
+{
+    int listen_fd;
+
+    listen_fd = lwan_create_listen_socket(t->lwan, num == 0);
+    if (listen_fd < 0)
+        lwan_status_critical("Could not create listen_fd");
+
+     /* Ignore errors here, as this is just a hint */
+#if defined(HAVE_SO_ATTACH_REUSEPORT_CBPF)
+    /* From socket(7): "These  options may be set repeatedly at any time on
+     * any socket in the group to replace the current BPF program used by
+     * all sockets in the group." */
+    if (num == 0) {
+        /* From socket(7): "The  BPF program must return an index between 0 and
+         * N-1 representing the socket which should receive the packet (where N
+         * is the number of sockets in the group)." */
+        const uint32_t cpu_ad_off = (uint32_t)SKF_AD_OFF + SKF_AD_CPU;
+        struct sock_filter filter[] = {
+            {BPF_LD | BPF_W | BPF_ABS, 0, 0, cpu_ad_off},   /* A = curr_cpu_index */
+            {BPF_RET | BPF_A, 0, 0, 0},                     /* return A */
+        };
+        struct sock_fprog fprog = {.filter = filter, .len = N_ELEMENTS(filter)};
+
+        (void)setsockopt(listen_fd, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF,
+                         &fprog, sizeof(fprog));
+        (void)setsockopt(listen_fd, SOL_SOCKET, SO_LOCK_FILTER,
+                         (int[]){1}, sizeof(int));
+    }
+#elif defined(HAVE_SO_INCOMING_CPU) && defined(__x86_64__)
+    (void)setsockopt(listen_fd, SOL_SOCKET, SO_INCOMING_CPU, &t->cpu,
+                     sizeof(t->cpu));
+#endif
+
+    struct epoll_event event = {
+        .events = EPOLLIN | EPOLLET | EPOLLERR,
+        .data.ptr = NULL,
+    };
+    if (epoll_ctl(t->epoll_fd, EPOLL_CTL_ADD, listen_fd, &event) < 0)
+        lwan_status_critical_perror("Could not add socket to epoll");
+
+    return listen_fd;
 }
 
 static void *thread_io_loop(void *data)
 {
     struct lwan_thread *t = data;
     int epoll_fd = t->epoll_fd;
-    const int read_pipe_fd = t->pipe_fd[0];
     const int max_events = LWAN_MIN((int)t->lwan->thread.max_fd, 1024);
     struct lwan *lwan = t->lwan;
     struct epoll_event *events;
@@ -456,11 +629,14 @@ static void *thread_io_loop(void *data)
 
     timeout_queue_init(&tq, lwan);
 
+    lwan_random_seed_prng_for_thread(t);
+
     pthread_barrier_wait(&lwan->thread.barrier);
 
     for (;;) {
         int timeout = turn_timer_wheel(&tq, t, epoll_fd);
         int n_fds = epoll_wait(epoll_fd, events, max_events, timeout);
+        bool accepted_connections = false;
 
         if (UNLIKELY(n_fds < 0)) {
             if (errno == EBADF || errno == EINVAL)
@@ -471,10 +647,14 @@ static void *thread_io_loop(void *data)
         for (struct epoll_event *event = events; n_fds--; event++) {
             struct lwan_connection *conn;
 
-            if (UNLIKELY(!event->data.ptr)) {
-                accept_nudge(read_pipe_fd, t, lwan->conns, &tq, &switcher,
-                             epoll_fd);
-                continue;
+            if (!event->data.ptr) {
+                if (LIKELY(accept_waiting_clients(t))) {
+                    accepted_connections = true;
+                    continue;
+                }
+                close(epoll_fd);
+                epoll_fd = -1;
+                break;
             }
 
             conn = event->data.ptr;
@@ -484,9 +664,17 @@ static void *thread_io_loop(void *data)
                 continue;
             }
 
+            if (!conn->coro) {
+                if (UNLIKELY(!spawn_coro(conn, &switcher, &tq)))
+                    continue;
+            }
+
             resume_coro(&tq, conn, epoll_fd);
             timeout_queue_move_to_last(&tq, conn);
         }
+
+        if (accepted_connections)
+            timeouts_add(t->wheel, &tq.timeout, 1000);
     }
 
     pthread_barrier_wait(&lwan->thread.barrier);
@@ -497,13 +685,11 @@ static void *thread_io_loop(void *data)
     return NULL;
 }
 
-static void create_thread(struct lwan *l, struct lwan_thread *thread,
-                          const size_t n_queue_fds)
+static void create_thread(struct lwan *l, struct lwan_thread *thread)
 {
     int ignore;
     pthread_attr_t attr;
 
-    memset(thread, 0, sizeof(*thread));
     thread->lwan = l;
 
     thread->wheel = timeouts_open(&ignore);
@@ -522,56 +708,11 @@ static void create_thread(struct lwan *l, struct lwan_thread *thread,
     if (pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE))
         lwan_status_critical_perror("pthread_attr_setdetachstate");
 
-#if defined(HAVE_EVENTFD)
-    int efd = eventfd(0, EFD_NONBLOCK | EFD_SEMAPHORE | EFD_CLOEXEC);
-    if (efd < 0)
-        lwan_status_critical_perror("eventfd");
-
-    thread->pipe_fd[0] = thread->pipe_fd[1] = efd;
-#else
-    if (pipe2(thread->pipe_fd, O_NONBLOCK | O_CLOEXEC) < 0)
-        lwan_status_critical_perror("pipe");
-#endif
-
-    struct epoll_event event = { .events = EPOLLIN, .data.ptr = NULL };
-    if (epoll_ctl(thread->epoll_fd, EPOLL_CTL_ADD, thread->pipe_fd[0], &event) < 0)
-        lwan_status_critical_perror("epoll_ctl");
-
     if (pthread_create(&thread->self, &attr, thread_io_loop, thread))
         lwan_status_critical_perror("pthread_create");
 
     if (pthread_attr_destroy(&attr))
         lwan_status_critical_perror("pthread_attr_destroy");
-
-    if (spsc_queue_init(&thread->pending_fds, n_queue_fds) < 0) {
-        lwan_status_critical("Could not initialize pending fd "
-                             "queue width %zu elements", n_queue_fds);
-    }
-}
-
-void lwan_thread_nudge(struct lwan_thread *t)
-{
-    uint64_t event = 1;
-
-    if (UNLIKELY(write(t->pipe_fd[1], &event, sizeof(event)) < 0))
-        lwan_status_perror("write");
-}
-
-void lwan_thread_add_client(struct lwan_thread *t, int fd)
-{
-    for (int i = 0; i < 10; i++) {
-        bool pushed = spsc_queue_push(&t->pending_fds, fd);
-
-        if (LIKELY(pushed))
-            return;
-
-        /* Queue is full; nudge the thread to consume it. */
-        lwan_thread_nudge(t);
-    }
-
-    lwan_status_error("Dropping connection %d", fd);
-    /* FIXME: send "busy" response now, even without receiving request? */
-    close(fd);
 }
 
 #if defined(__linux__) && defined(__x86_64__)
@@ -579,7 +720,10 @@ static bool read_cpu_topology(struct lwan *l, uint32_t siblings[])
 {
     char path[PATH_MAX];
 
-    for (unsigned int i = 0; i < l->n_cpus; i++) {
+    for (uint32_t i = 0; i < l->available_cpus; i++)
+        siblings[i] = 0xbebacafe;
+
+    for (unsigned int i = 0; i < l->available_cpus; i++) {
         FILE *sib;
         uint32_t id, sibling;
         char separator;
@@ -612,8 +756,28 @@ static bool read_cpu_topology(struct lwan *l, uint32_t siblings[])
             __builtin_unreachable();
         }
 
-
         fclose(sib);
+    }
+
+    /* Perform a sanity check here, as some systems seem to filter out the
+     * result of sysconf() to obtain the number of configured and online
+     * CPUs but don't bother changing what's available through sysfs as far
+     * as the CPU topology information goes.  It's better to fall back to a
+     * possibly non-optimal setup than just crash during startup while
+     * trying to perform an out-of-bounds array access.  */
+    for (unsigned int i = 0; i < l->available_cpus; i++) {
+        if (siblings[i] == 0xbebacafe) {
+            lwan_status_warning("Could not determine sibling for CPU %d", i);
+            return false;
+        }
+
+        if (siblings[i] >= l->available_cpus) {
+            lwan_status_warning("CPU information topology says CPU %d exists, "
+                                "but max available CPUs is %d (online CPUs: %d). "
+                                "Is Lwan running in a (broken) container?",
+                                siblings[i], l->available_cpus, l->online_cpus);
+            return false;
+        }
     }
 
     return true;
@@ -622,13 +786,13 @@ static bool read_cpu_topology(struct lwan *l, uint32_t siblings[])
 static void
 siblings_to_schedtbl(struct lwan *l, uint32_t siblings[], uint32_t schedtbl[])
 {
-    int *seen = alloca(l->n_cpus * sizeof(int));
-    int n_schedtbl = 0;
+    int *seen = alloca(l->available_cpus * sizeof(int));
+    unsigned int n_schedtbl = 0;
 
-    for (uint32_t i = 0; i < l->n_cpus; i++)
+    for (uint32_t i = 0; i < l->available_cpus; i++)
         seen[i] = -1;
 
-    for (uint32_t i = 0; i < l->n_cpus; i++) {
+    for (uint32_t i = 0; i < l->available_cpus; i++) {
         if (seen[siblings[i]] < 0) {
             seen[siblings[i]] = (int)i;
         } else {
@@ -637,61 +801,60 @@ siblings_to_schedtbl(struct lwan *l, uint32_t siblings[], uint32_t schedtbl[])
         }
     }
 
-    if (!n_schedtbl)
-        memcpy(schedtbl, seen, l->n_cpus * sizeof(int));
+    if (n_schedtbl != l->available_cpus)
+        memcpy(schedtbl, seen, l->available_cpus * sizeof(int));
 }
 
-static void
+static bool
 topology_to_schedtbl(struct lwan *l, uint32_t schedtbl[], uint32_t n_threads)
 {
-    uint32_t *siblings = alloca(l->n_cpus * sizeof(uint32_t));
+    uint32_t *siblings = alloca(l->available_cpus * sizeof(uint32_t));
 
-    if (!read_cpu_topology(l, siblings)) {
-        for (uint32_t i = 0; i < n_threads; i++)
-            schedtbl[i] = (i / 2) % l->thread.count;
-    } else {
-        uint32_t *affinity = alloca(l->n_cpus * sizeof(uint32_t));
+    if (read_cpu_topology(l, siblings)) {
+        uint32_t *affinity = alloca(l->available_cpus * sizeof(uint32_t));
 
         siblings_to_schedtbl(l, siblings, affinity);
 
         for (uint32_t i = 0; i < n_threads; i++)
-            schedtbl[i] = affinity[i % l->n_cpus];
+            schedtbl[i] = affinity[i % l->available_cpus];
+        return true;
     }
+
+    for (uint32_t i = 0; i < n_threads; i++)
+        schedtbl[i] = (i / 2) % l->thread.count;
+    return false;
 }
 
 static void
-adjust_threads_affinity(struct lwan *l, uint32_t *schedtbl, uint32_t mask)
+adjust_thread_affinity(const struct lwan_thread *thread)
 {
-    for (uint32_t i = 0; i < l->thread.count; i++) {
-        cpu_set_t set;
+    cpu_set_t set;
 
-        CPU_ZERO(&set);
-        CPU_SET(schedtbl[i & mask], &set);
+    CPU_ZERO(&set);
+    CPU_SET(thread->cpu, &set);
 
-        if (pthread_setaffinity_np(l->thread.threads[i].self, sizeof(set),
-                                   &set))
-            lwan_status_warning("Could not set affinity for thread %d", i);
-    }
+    if (pthread_setaffinity_np(thread->self, sizeof(set), &set))
+        lwan_status_warning("Could not set thread affinity");
 }
 #elif defined(__x86_64__)
-static void
+static bool
 topology_to_schedtbl(struct lwan *l, uint32_t schedtbl[], uint32_t n_threads)
 {
     for (uint32_t i = 0; i < n_threads; i++)
         schedtbl[i] = (i / 2) % l->thread.count;
+    return false;
 }
 
 static void
-adjust_threads_affinity(struct lwan *l, uint32_t *schedtbl, uint32_t n)
+adjust_thread_affinity(const struct lwan_thread *thread)
 {
+    (void)thread;
 }
 #endif
 
 void lwan_thread_init(struct lwan *l)
 {
-    if (pthread_barrier_init(&l->thread.barrier, NULL,
-                             (unsigned)l->thread.count + 1))
-        lwan_status_critical("Could not create barrier");
+    const unsigned int total_conns = l->thread.max_fd * l->thread.count;
 
     lwan_status_debug("Initializing threads");
 
@@ -700,16 +863,17 @@ void lwan_thread_init(struct lwan *l)
     if (!l->thread.threads)
         lwan_status_critical("Could not allocate memory for threads");
 
-    const size_t n_queue_fds = LWAN_MIN(l->thread.max_fd / l->thread.count,
-                                        (size_t)(2 * lwan_socket_get_backlog_size()));
-    lwan_status_debug("Pending client file descriptor queue has %zu items", n_queue_fds);
-    for (unsigned int i = 0; i < l->thread.count; i++)
-        create_thread(l, &l->thread.threads[i], n_queue_fds);
-
-    const unsigned int total_conns = l->thread.max_fd * l->thread.count;
 #ifdef __x86_64__
     static_assert(sizeof(struct lwan_connection) == 32,
                   "Two connections per cache line");
+#ifdef _SC_LEVEL1_DCACHE_LINESIZE
+    assert(sysconf(_SC_LEVEL1_DCACHE_LINESIZE) == 64);
+#endif
+
+    lwan_status_debug("%d CPUs of %d are online. "
+                      "Reading topology to pre-schedule clients",
+                      l->online_cpus, l->available_cpus);
+
     /*
      * Pre-schedule each file descriptor, to reduce some operations in the
      * fast path.
@@ -719,21 +883,65 @@ void lwan_thread_init(struct lwan *l)
      * use the CPU topology to group two connections per cache line in such
      * a way that false sharing is avoided.
      */
-    uint32_t n_threads = (uint32_t)lwan_nextpow2((size_t)((l->thread.count - 1) * 2));
+    uint32_t n_threads =
+        (uint32_t)lwan_nextpow2((size_t)((l->thread.count - 1) * 2));
     uint32_t *schedtbl = alloca(n_threads * sizeof(uint32_t));
 
-    topology_to_schedtbl(l, schedtbl, n_threads);
+    bool adj_affinity = topology_to_schedtbl(l, schedtbl, n_threads);
 
     n_threads--; /* Transform count into mask for AND below */
-    adjust_threads_affinity(l, schedtbl, n_threads);
+
     for (unsigned int i = 0; i < total_conns; i++)
         l->conns[i].thread = &l->thread.threads[schedtbl[i & n_threads]];
 #else
+    for (unsigned int i = 0; i < l->thread.count; i++)
+        l->thread.threads[i].cpu = i % l->online_cpus;
     for (unsigned int i = 0; i < total_conns; i++)
         l->conns[i].thread = &l->thread.threads[i % l->thread.count];
+
+    uint32_t *schedtbl = NULL;
+    const bool adj_affinity = false;
 #endif
 
-    pthread_barrier_wait(&l->thread.barrier);
+    for (unsigned int i = 0; i < l->thread.count; i++) {
+        struct lwan_thread *thread = NULL;
+
+        if (schedtbl) {
+            /* This is not the most elegant thing, but this assures that the
+             * listening sockets are added to the SO_REUSEPORT group in a
+             * specific order, because that's what the CBPF program to direct
+             * the incoming connection to the right CPU will use. */
+            for (uint32_t thread_id = 0; thread_id < l->thread.count;
+                 thread_id++) {
+                if (schedtbl[thread_id & n_threads] == i) {
+                    thread = &l->thread.threads[thread_id];
+                    break;
+                }
+            }
+            if (!thread) {
+                /* FIXME: can this happen when we have a offline CPU? */
+                lwan_status_critical(
+                    "Could not figure out which CPU thread %d should go to", i);
+            }
+        } else {
+            thread = &l->thread.threads[i % l->thread.count];
+        }
+
+        if (pthread_barrier_init(&l->thread.barrier, NULL, 2))
+            lwan_status_critical("Could not create barrier");
+
+        create_thread(l, thread);
+
+        if ((thread->listen_fd = create_listen_socket(thread, i)) < 0)
+            lwan_status_critical_perror("Could not create listening socket");
+
+        if (adj_affinity) {
+            l->thread.threads[i].cpu = schedtbl[i & n_threads];
+            adjust_thread_affinity(thread);
+        }
+
+        pthread_barrier_wait(&l->thread.barrier);
+    }
 
     lwan_status_debug("Worker threads created and ready to serve");
 }
@@ -744,9 +952,13 @@ void lwan_thread_shutdown(struct lwan *l)
 
     for (unsigned int i = 0; i < l->thread.count; i++) {
         struct lwan_thread *t = &l->thread.threads[i];
+        int epoll_fd = t->epoll_fd;
+        int listen_fd = t->listen_fd;
 
-        close(t->epoll_fd);
-        lwan_thread_nudge(t);
+        t->listen_fd = -1;
+        t->epoll_fd = -1;
+        close(epoll_fd);
+        close(listen_fd);
     }
 
     pthread_barrier_wait(&l->thread.barrier);
@@ -755,13 +967,7 @@ void lwan_thread_shutdown(struct lwan *l)
     for (unsigned int i = 0; i < l->thread.count; i++) {
         struct lwan_thread *t = &l->thread.threads[i];
 
-        close(t->pipe_fd[0]);
-#if !defined(HAVE_EVENTFD)
-        close(t->pipe_fd[1]);
-#endif
-
         pthread_join(l->thread.threads[i].self, NULL);
-        spsc_queue_free(&t->pending_fds);
         timeouts_close(t->wheel);
     }
 

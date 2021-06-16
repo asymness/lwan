@@ -347,14 +347,14 @@ static void *lex_error(struct lexer *lexer, const char *msg, ...)
     return NULL;
 }
 
-static bool isident(int ch)
+static bool is_ident(int ch)
 {
     return isalnum(ch) || ch == '_' || ch == '.' || ch == '/';
 }
 
 static void *lex_identifier(struct lexer *lexer)
 {
-    while (isident(next(lexer)))
+    while (is_ident(next(lexer)))
         ;
     backup(lexer);
     emit(lexer, LEXEME_IDENTIFIER);
@@ -374,7 +374,7 @@ static void *lex_partial(struct lexer *lexer)
             ignore(lexer);
             continue;
         }
-        if (isident(r)) {
+        if (is_ident(r)) {
             backup(lexer);
             return lex_identifier;
         }
@@ -452,7 +452,7 @@ static void *lex_inside_action(struct lexer *lexer)
                 ignore(lexer);
                 continue;
             }
-            if (isident(r)) {
+            if (is_ident(r)) {
                 backup(lexer);
                 return lex_identifier;
             }
@@ -1394,7 +1394,7 @@ lwan_tpl_compile_file(const char *filename,
     if (fstat(fd, &st) < 0)
         goto close_file;
 
-    mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    mapped = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     if (mapped == MAP_FAILED)
         goto close_file;
 

@@ -52,9 +52,9 @@ static struct db_connection_params {
 
 static const char hello_world[] = "Hello, World!";
 static const char random_number_query[] =
-    "SELECT randomNumber FROM world WHERE id=?";
+    "SELECT randomNumber, id FROM world WHERE id=?";
 static const char cached_random_number_query[] =
-    "SELECT randomNumber FROM cachedworld WHERE id=?";
+    "SELECT randomNumber, id FROM world WHERE id=?";
 
 struct Fortune {
     struct {
@@ -188,6 +188,8 @@ LWAN_HANDLER(json)
 {
     struct hello_world_json j = {.message = hello_world};
 
+    request->flags |= RESPONSE_NO_EXPIRES;
+
     return json_response_obj(response, hello_world_json_desc,
                              N_ELEMENTS(hello_world_json_desc), &j);
 }
@@ -199,10 +201,11 @@ static bool db_query_key(struct db_stmt *stmt, struct db_json *out, int key)
         return false;
 
     long random_number;
-    if (UNLIKELY(!db_stmt_step(stmt, "i", &random_number)))
+    long id;
+    if (UNLIKELY(!db_stmt_step(stmt, "ii", &random_number, &id)))
         return false;
 
-    out->id = row.u.i;
+    out->id = (int)id;
     out->randomNumber = (int)random_number;
 
     return true;
@@ -230,6 +233,8 @@ LWAN_HANDLER(db)
 
     if (!queried)
         return HTTP_INTERNAL_ERROR;
+
+    request->flags |= RESPONSE_NO_EXPIRES;
 
     return json_response_obj(response, db_json_desc, N_ELEMENTS(db_json_desc),
                          &db_json);
@@ -261,8 +266,9 @@ LWAN_HANDLER(queries)
      * so this is a good approximation.  */
     lwan_strbuf_grow_to(response->buffer, (size_t)(32l * queries));
 
-    ret = json_response_arr(response, &queries_array_desc, &qj);
+    request->flags |= RESPONSE_NO_EXPIRES;
 
+    ret = json_response_arr(response, &queries_array_desc, &qj);
 out:
     db_stmt_finalize(stmt);
 
@@ -306,7 +312,39 @@ static void cached_queries_free(struct cache_entry *entry, void *context)
     free(entry);
 }
 
-LWAN_HANDLER(cached_world)
+static struct cache_entry *my_cache_coro_get_and_ref_entry(struct cache *cache,
+                                                           struct lwan_request *request,
+                                                           const char *key)
+{
+    /* Using this function instead of cache_coro_get_and_ref_entry() will avoid
+     * calling coro_defer(), which, in cases where the number of cached queries is
+     * too high, will trigger reallocations of the coro_defer array (and the "demotion"
+     * from the storage inlined in the coro struct to somewhere in the heap).
+     *
+     * For large number of cached elements, too, this will reduce the number of
+     * indirect calls that are performed every time a request is serviced.
+     */
+
+    for (int tries = 64; tries; tries--) {
+        int error;
+        struct cache_entry *ce = cache_get_and_ref_entry(cache, key, &error);
+
+        if (LIKELY(ce))
+            return ce;
+
+        if (error != EWOULDBLOCK)
+            break;
+
+        coro_yield(request->conn->coro, CONN_CORO_WANT_WRITE);
+
+        if (tries > 16)
+            lwan_request_sleep(request, (unsigned int)(tries / 8));
+    }
+
+    return NULL;
+}
+
+LWAN_HANDLER(cached_queries)
 {
     const char *queries_str = lwan_request_get_query_param(request, "count");
     long queries;
@@ -321,13 +359,15 @@ LWAN_HANDLER(cached_world)
         struct db_json_cached *jc;
         size_t discard;
 
-        jc = (struct db_json_cached *)cache_coro_get_and_ref_entry(
-            cached_queries_cache, request->conn->coro,
+        jc = (struct db_json_cached *)my_cache_coro_get_and_ref_entry(
+            cached_queries_cache, request,
             int_to_string(rand() % 10000, key_buf, &discard));
         if (UNLIKELY(!jc))
             return HTTP_INTERNAL_ERROR;
 
         qj.queries[i] = jc->db_json;
+
+        cache_entry_unref(cached_queries_cache, (struct cache_entry *)jc);
     }
 
     /* Avoid reallocations/copies while building response.  Each response
@@ -335,6 +375,7 @@ LWAN_HANDLER(cached_world)
      * so this is a good approximation.  */
     lwan_strbuf_grow_to(response->buffer, (size_t)(32l * queries));
 
+    request->flags |= RESPONSE_NO_EXPIRES;
     return json_response_arr(response, &queries_array_desc, &qj);
 }
 
@@ -343,6 +384,7 @@ LWAN_HANDLER(plaintext)
     lwan_strbuf_set_static(response->buffer, hello_world,
                            sizeof(hello_world) - 1);
 
+    request->flags |= RESPONSE_NO_EXPIRES;
     response->mime_type = "text/plain";
     return HTTP_OK;
 }
@@ -426,6 +468,7 @@ LWAN_HANDLER(fortunes)
                                              &fortune)))
         return HTTP_INTERNAL_ERROR;
 
+    request->flags |= RESPONSE_NO_EXPIRES;
     response->mime_type = "text/html; charset=UTF-8";
     return HTTP_OK;
 }

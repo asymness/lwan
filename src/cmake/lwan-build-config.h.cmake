@@ -33,7 +33,6 @@
 #cmakedefine HAVE_RAWMEMCHR
 #cmakedefine HAVE_READAHEAD
 #cmakedefine HAVE_REALLOCARRAY
-#cmakedefine HAVE_EVENTFD
 #cmakedefine HAVE_EPOLL
 #cmakedefine HAVE_KQUEUE
 #cmakedefine HAVE_DLADDR
@@ -44,6 +43,10 @@
 #cmakedefine HAVE_FWRITE_UNLOCKED
 #cmakedefine HAVE_GETTID
 #cmakedefine HAVE_SECURE_GETENV
+#cmakedefine HAVE_STATFS
+#cmakedefine HAVE_SO_ATTACH_REUSEPORT_CBPF
+#cmakedefine HAVE_SO_INCOMING_CPU
+#cmakedefine HAVE_SYSLOG
 
 /* Compiler builtins for specific CPU instruction support */
 #cmakedefine HAVE_BUILTIN_CLZLL
@@ -60,6 +63,7 @@
 #cmakedefine HAVE_LUA
 #cmakedefine HAVE_BROTLI
 #cmakedefine HAVE_ZSTD
+#cmakedefine HAVE_LIBUCONTEXT
 
 /* Valgrind support for coroutines */
 #cmakedefine HAVE_VALGRIND

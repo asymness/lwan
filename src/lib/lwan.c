@@ -43,6 +43,12 @@
 #include "lwan-lua.h"
 #endif
 
+/* Ideally, this would check if all items in enum lwan_request_flags,
+ * when bitwise-or'd together, would not have have any bit set that
+ * is also set in REQUEST_METHOD_MASK. */
+static_assert(REQUEST_ACCEPT_DEFLATE > REQUEST_METHOD_MASK,
+              "enough bits to store request methods");
+
 /* See detect_fastest_monotonic_clock() */
 clockid_t monotonic_clock_id = CLOCK_MONOTONIC;
 
@@ -50,13 +56,14 @@ static const struct lwan_config default_config = {
     .listener = "localhost:8080",
     .keep_alive_timeout = 15,
     .quiet = false,
-    .reuse_port = false,
     .proxy_protocol = false,
     .allow_cors = false,
     .expires = 1 * ONE_WEEK,
     .n_threads = 0,
     .max_post_data_size = 10 * DEFAULT_BUFFER_SIZE,
     .allow_post_temp_file = false,
+    .max_put_data_size = 10 * DEFAULT_BUFFER_SIZE,
+    .allow_put_temp_file = false,
 };
 
 LWAN_HANDLER(brew_coffee)
@@ -291,6 +298,19 @@ error:
     free(url_map->authorization.password_file);
 }
 
+__attribute__((no_sanitize_address))
+static const char *get_module_name(const struct lwan_module *module)
+{
+    const struct lwan_module_info *iter;
+
+    LWAN_SECTION_FOREACH(lwan_module, iter) {
+        if (iter->module == module)
+            return iter->name;
+    }
+
+    return "<unknown>";
+}
+
 static void parse_listener_prefix(struct config *c,
                                   const struct config_line *l,
                                   struct lwan *lwan,
@@ -301,6 +321,9 @@ static void parse_listener_prefix(struct config *c,
     struct hash *hash = hash_str_new(free, free);
     char *prefix = strdupa(l->value);
     struct config *isolated;
+
+    if (!hash)
+        lwan_status_critical("Could not allocate hash table");
 
     isolated = config_isolate_section(c, l);
     if (!isolated) {
@@ -342,6 +365,9 @@ add_map:
 
         hash = NULL;
     } else if (module->create_from_hash && module->handle_request) {
+        lwan_status_debug("Initializing module %s from config",
+                          get_module_name(module));
+
         url_map.data = module->create_from_hash(prefix, hash);
         if (!url_map.data) {
             config_error(c, "Could not create module instance");
@@ -384,7 +410,15 @@ void lwan_set_url_map(struct lwan *l, const struct lwan_url_map *map)
         struct lwan_url_map *copy = add_url_map(&l->url_map_trie, NULL, map);
 
         if (copy->module && copy->module->create) {
-            copy->data = copy->module->create (map->prefix, copy->args);
+            lwan_status_debug("Initializing module %s from struct",
+                              get_module_name(copy->module));
+
+            copy->data = copy->module->create(map->prefix, copy->args);
+            if (!copy->data) {
+                lwan_status_critical("Could not initialize module %s",
+                                     get_module_name(copy->module));
+            }
+
             copy->flags = copy->module->flags;
             copy->handler = copy->module->handle_request;
         } else {
@@ -495,9 +529,6 @@ static bool setup_from_config(struct lwan *lwan, const char *path)
             } else if (streq(line->key, "quiet")) {
                 lwan->config.quiet =
                     parse_bool(line->value, default_config.quiet);
-            } else if (streq(line->key, "reuse_port")) {
-                lwan->config.reuse_port =
-                    parse_bool(line->value, default_config.reuse_port);
             } else if (streq(line->key, "proxy_protocol")) {
                 lwan->config.proxy_protocol =
                     parse_bool(line->value, default_config.proxy_protocol);
@@ -526,9 +557,27 @@ static bool setup_from_config(struct lwan *lwan, const char *path)
                     config_error(conf,
                                  "Maximum post data can't be over 128MiB");
                 lwan->config.max_post_data_size = (size_t)max_post_data_size;
+            } else if (streq(line->key, "max_put_data_size")) {
+                long max_put_data_size = parse_long(
+                    line->value, (long)default_config.max_put_data_size);
+                if (max_put_data_size < 0)
+                    config_error(conf, "Negative maximum put data size");
+                else if (max_put_data_size > 128 * (1 << 20))
+                    config_error(conf,
+                                 "Maximum put data can't be over 128MiB");
+                lwan->config.max_put_data_size = (size_t)max_put_data_size;
             } else if (streq(line->key, "allow_temp_files")) {
-                lwan->config.allow_post_temp_file =
-                    !!strstr(line->value, "post");
+                bool has_post, has_put;
+
+                if (strstr(line->value, "all")) {
+                    has_post = has_put = true;
+                } else {
+                    has_post = !!strstr(line->value, "post");
+                    has_put = !!strstr(line->value, "put");
+                }
+
+                lwan->config.allow_post_temp_file = has_post;
+                lwan->config.allow_put_temp_file = has_put;
             } else {
                 config_error(conf, "Unknown config key: %s", line->key);
             }
@@ -627,17 +676,26 @@ static void allocate_connections(struct lwan *l, size_t max_open_files)
     memset(l->conns, 0, sz);
 }
 
-static unsigned int get_number_of_cpus(void)
+static void get_number_of_cpus(struct lwan *l)
 {
     long n_online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    long n_available_cpus = sysconf(_SC_NPROCESSORS_CONF);
 
-    if (UNLIKELY(n_online_cpus < 0)) {
+    if (n_online_cpus < 0) {
         lwan_status_warning(
             "Could not get number of online CPUs, assuming 1 CPU");
-        return 1;
+        n_online_cpus = 1;
     }
 
-    return (unsigned int)n_online_cpus;
+    if (n_available_cpus < 0) {
+        lwan_status_warning(
+            "Could not get number of available CPUs, assuming %ld CPUs",
+            n_online_cpus);
+        n_available_cpus = n_online_cpus;
+    }
+
+    l->online_cpus = (unsigned int)n_online_cpus;
+    l->available_cpus = (unsigned int)n_available_cpus;
 }
 
 void lwan_init(struct lwan *l) { lwan_init_with_config(l, &default_config); }
@@ -680,17 +738,18 @@ void lwan_init_with_config(struct lwan *l, const struct lwan_config *config)
     /* Continue initialization as normal. */
     lwan_status_debug("Initializing lwan web server");
 
-    l->n_cpus = get_number_of_cpus();
+    get_number_of_cpus(l);
     if (!l->config.n_threads) {
-        l->thread.count = l->n_cpus;
+        l->thread.count = l->online_cpus;
         if (l->thread.count == 1)
             l->thread.count = 2;
-    } else if (l->config.n_threads > 3 * l->n_cpus) {
-        l->thread.count = l->n_cpus * 3;
+    } else if (l->config.n_threads > 3 * l->online_cpus) {
+        l->thread.count = l->online_cpus * 3;
 
-        lwan_status_warning("%d threads requested, but only %d online CPUs; "
-                            "capping to %d threads",
-                            l->config.n_threads, l->n_cpus, 3 * l->n_cpus);
+        lwan_status_warning("%d threads requested, but only %d online CPUs "
+                            "(out of %d configured CPUs); capping to %d threads",
+                            l->config.n_threads, l->online_cpus, l->available_cpus,
+                            3 * l->online_cpus);
     } else if (l->config.n_threads > 255) {
         l->thread.count = 256;
 
@@ -711,7 +770,6 @@ void lwan_init_with_config(struct lwan *l, const struct lwan_config *config)
 
     lwan_readahead_init();
     lwan_thread_init(l);
-    lwan_socket_init(l);
     lwan_http_authorize_init();
 }
 
@@ -739,106 +797,11 @@ void lwan_shutdown(struct lwan *l)
     lwan_readahead_shutdown();
 }
 
-static ALWAYS_INLINE int schedule_client(struct lwan *l, int fd)
-{
-    struct lwan_thread *thread = l->conns[fd].thread;
-
-    lwan_thread_add_client(thread, fd);
-
-    return (int)(thread - l->thread.threads);
-}
-
-static volatile sig_atomic_t main_socket = -1;
-
-static_assert(sizeof(main_socket) >= sizeof(int),
-              "size of sig_atomic_t > size of int");
-
-static void sigint_handler(int signal_number __attribute__((unused)))
-{
-    if (main_socket < 0)
-        return;
-
-    shutdown((int)main_socket, SHUT_RDWR);
-    close((int)main_socket);
-
-    main_socket = -1;
-}
-
-enum herd_accept { HERD_MORE = 0, HERD_GONE = -1, HERD_SHUTDOWN = 1 };
-
-struct core_bitmap {
-    uint64_t bitmap[4];
-};
-
-static ALWAYS_INLINE enum herd_accept
-accept_one(struct lwan *l, struct core_bitmap *cores)
-{
-    int fd = accept4((int)main_socket, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-
-    if (LIKELY(fd >= 0)) {
-        int core = schedule_client(l, fd);
-
-        cores->bitmap[core / 64] |= UINT64_C(1)<<(core % 64);
-
-        return HERD_MORE;
-    }
-
-    switch (errno) {
-    case EAGAIN:
-        return HERD_GONE;
-
-    case EBADF:
-    case ECONNABORTED:
-    case EINVAL:
-        if (main_socket < 0) {
-            lwan_status_info("Signal 2 (Interrupt) received");
-        } else {
-            lwan_status_info("Main socket closed for unknown reasons");
-        }
-        return HERD_SHUTDOWN;
-
-    default:
-        lwan_status_perror("accept");
-        return HERD_MORE;
-    }
-}
-
 void lwan_main_loop(struct lwan *l)
 {
-    struct core_bitmap cores = {};
-
-    assert(main_socket == -1);
-    main_socket = l->main_socket;
-
-    if (signal(SIGINT, sigint_handler) == SIG_ERR)
-        lwan_status_critical("Could not set signal handler");
-
     lwan_status_info("Ready to serve");
 
-    while (true) {
-        enum herd_accept ha;
-
-        fcntl(l->main_socket, F_SETFL, 0);
-        ha = accept_one(l, &cores);
-        if (ha == HERD_MORE) {
-            fcntl(l->main_socket, F_SETFL, O_NONBLOCK);
-
-            do {
-                ha = accept_one(l, &cores);
-            } while (ha == HERD_MORE);
-        }
-
-        if (UNLIKELY(ha > HERD_MORE))
-            break;
-
-        for (size_t i = 0; i < N_ELEMENTS(cores.bitmap); i++) {
-            for (uint64_t c = cores.bitmap[i]; c; c ^= c & -c) {
-                size_t core = (size_t)__builtin_ctzl(c);
-                lwan_thread_nudge(&l->thread.threads[i * 64 + core]);
-            }
-        }
-        cores = (struct core_bitmap){};
-    }
+    lwan_job_thread_main_loop();
 }
 
 #ifdef CLOCK_MONOTONIC_COARSE

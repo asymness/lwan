@@ -398,10 +398,10 @@ class TestFileServing(LwanTest):
 
     self.assertResponseHtml(r)
 
-    self.assertTrue('<h1>Index of &#x2f;icons</h1>' in r.text)
+    self.assertTrue('<h1>Index of icons</h1>' in r.text)
 
     def assertHasImage(name):
-      imgtag = "<a href=\"&#x2f;icons/%s.gif\">%s.gif</a>" % (name, name)
+      imgtag = "<a href=\"%s.gif\">%s.gif</a>" % (name, name)
       self.assertTrue(imgtag in r.text)
 
     assertHasImage('back')
@@ -431,7 +431,7 @@ class TestFileServing(LwanTest):
 
     self.assertResponsePlain(r, 301)
     self.assertTrue('location' in r.headers)
-    self.assertEqual(r.headers['location'], '/icons/')
+    self.assertEqual(r.headers['location'], 'icons/')
 
 class TestRedirect(LwanTest):
   def test_redirect_default(self):
@@ -682,6 +682,16 @@ class TestAuthentication(LwanTest):
 
 
 class TestHelloWorld(LwanTest):
+  def test_request_id(self):
+    all_request_ids = set()
+    for i in range(20):
+      r = requests.get('http://127.0.0.1:8080/hello')
+      self.assertResponsePlain(r)
+      request_id = r.headers['x-request-id']
+      self.assertFalse(request_id in all_request_ids)
+      self.assertTrue(re.match(r'^[a-f0-9]{16}$', request_id))
+      all_request_ids.add(request_id)
+
   def test_cookies(self):
     c = {
         'SOMECOOKIE': '1c330301-89e4-408a-bf6c-ce107efe8a27',
@@ -972,7 +982,7 @@ class TestFuzzRegressionBase(SocketTest):
 
   @staticmethod
   def wrap(name):
-    with open(os.path.join("fuzz", name), "rb") as f:
+    with open(os.path.join("fuzz", "regression", name), "rb") as f:
       contents = str(f.read(), "latin-1")
     def run_test_wrapped(self):
       return self.run_test(contents)
@@ -981,7 +991,7 @@ class TestFuzzRegressionBase(SocketTest):
 TestFuzzRegression = type('TestFuzzRegression', (TestFuzzRegressionBase,), {
   "test_" + name.replace("-", "_"): TestFuzzRegressionBase.wrap(name)
   for name in (
-    cf for cf in os.listdir("fuzz") if cf.startswith(("clusterfuzz-", "crash-"))
+    cf for cf in os.listdir("fuzz/regression") if cf.startswith(("clusterfuzz-", "crash-"))
   )
 })
 

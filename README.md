@@ -52,6 +52,8 @@ The build system will look for these libraries and enable/link if available.
     - Client libraries for either [MySQL](https://dev.mysql.com) or [MariaDB](https://mariadb.org)
     - [SQLite 3](http://sqlite.org)
 
+On non-x86 systems, [libucontext](https://github.com/kaniini/libucontext)
+will be downloaded and built alongside Lwan.
 
 ### Common operating system package names
 
@@ -135,7 +137,11 @@ Alternative memory allocators can be selected as well.  Lwan currently
 supports [TCMalloc](https://github.com/gperftools/gperftools),
 [mimalloc](https://github.com/microsoft/mimalloc), and
 [jemalloc](http://jemalloc.net/) out of the box.  To use either one of them,
-pass `-DALTERNATIVE_MALLOC=ON` to the CMake invocation line.
+pass `-DALTERNATIVE_MALLOC=name` to the CMake invocation line, using the
+names provided in the "Optional dependencies"  section.
+
+The `-DUSE_SYSLOG=ON` option can be passed to CMake to also log to the system log
+in addition to the standard output.
 
 ### Tests
 
@@ -233,8 +239,8 @@ Some examples can be found in `lwan.conf` and `techempower.conf`.
 #### Time Intervals
 
 Time fields can be specified using multipliers. Multiple can be specified, they're
-just added together; for instance, "1M 1w" specifies "1 month and 1 week".  The following
-table lists all known multipliers:
+just added together; for instance, "1M 1w" specifies "1 month and 1 week"
+(37 days).  The following table lists all known multipliers:
 
 | Multiplier | Description |
 |------------|-------------|
@@ -242,9 +248,9 @@ table lists all known multipliers:
 | `m`        | Minutes |
 | `h`        | Hours |
 | `d`        | Days |
-| `w`        | Weeks |
-| `M`        | Months |
-| `y`        | Years |
+| `w`        | 7-day Weeks |
+| `M`        | 30-day Months |
+| `y`        | 365-day Years |
 
 A number with a multiplier not in this table is ignored; a warning is issued while
 reading the configuration file.  No spaces must exist between the number and its
@@ -269,11 +275,12 @@ can be decided automatically, so some configuration options are provided.
 |--------|------|---------|-------------|
 | `keep_alive_timeout` | `time`  | `15` | Timeout to keep a connection alive |
 | `quiet` | `bool` | `false` | Set to true to not print any debugging messages. Only effective in release builds. |
-| `reuse_port` | `bool` | `false` | Sets `SO_REUSEPORT` to `1` in the master socket |
 | `expires` | `time` | `1M 1w` | Value of the "Expires" header. Default is 1 month and 1 week |
 | `threads` | `int` | `0` | Number of I/O threads. Default (0) is the number of online CPUs |
 | `proxy_protocol` | `bool` | `false` | Enables the [PROXY protocol](https://www.haproxy.com/blog/haproxy/proxy-protocol/). Versions 1 and 2 are supported. Only enable this setting if using Lwan behind a proxy, and the proxy supports this protocol; otherwise, this allows anybody to spoof origin IP addresses |
 | `max_post_data_size` | `int` | `40960` | Sets the maximum number of data size for POST requests, in bytes |
+| `max_put_data_size` | `int` | `40960` | Sets the maximum number of data size for PUT requests, in bytes |
+| `allow_temp_files` | `str` | `""` | Use temporary files; set to `post` for POST requests, `put` for PUT requests, or `all` (equivalent to setting to `post put`) for both.|
 
 ### Straitjacket
 
@@ -419,10 +426,17 @@ information from the request, or to set the response, as seen below:
    - `req:send_event(event, str)` sends an event (using server-sent events)
    - `req:cookie(param)` returns the cookie named `param`, or `nil` is not found
    - `req:set_headers(tbl)` sets the response headers from the table `tbl`; a header may be specified multiple times by using a table, rather than a string, in the table value (`{'foo'={'bar', 'baz'}}`); must be called before sending any response with `say()` or `send_event()`
+   - `req:header(name)` obtains the header from the request with the given name or `nil` if not found
    - `req:sleep(ms)` pauses the current handler for the specified amount of milliseconds
    - `req:ws_upgrade()` returns `1` if the connection could be upgraded to a WebSocket; `0` otherwise
    - `req:ws_write(str)` sends `str` through the WebSocket-upgraded connection
-   - `req:ws_read()` returns a string obtained from the WebSocket, or `nil` on error
+   - `req:ws_read()` returns a string with the contents of the last WebSocket frame, or a number indicating an status (ENOTCONN/107 on Linux if it has been disconnected; EAGAIN/11 on Linux if nothing was available; ENOMSG/42 on Linux otherwise).  The return value here might change in the future for something more Lua-like.
+   - `req:remote_address()` returns a string with the remote IP address.
+   - `req:path()` returns a string with the request path.
+   - `req:query_string()` returns a string with the query string (empty string if no query string present).
+   - `req:body()` returns the request body (POST/PUT requests).
+   - `req:request_id()` returns a string containing the request ID.
+   - `req:request_date()` returns the date as it'll be written in the `Date` response header.
 
 Handler functions may return either `nil` (in which case, a `200 OK` response
 is generated), or a number matching an HTTP status code.  Attempting to return
@@ -441,10 +455,17 @@ in a `500 Internal Server Error` response being thrown.
 The `rewrite` module will match
 [patterns](https://man.openbsd.org/patterns.7) in URLs and give the option
 to either redirect to another URL, or rewrite the request in a way that Lwan
-will handle the request as if it were made in that way originally.  The
-patterns are a special kind of regular expressions, forked from Lua 5.3.1,
-that do not contain backreferences and other features that could create
-denial-of-service issues in Lwan.  The new URL can be specified using a
+will handle the request as if it were made in that way originally.
+
+Forked from Lua 5.3.1, the regular expresion engine may not be as
+feature-packed as most general-purpose engines, but has been chosen
+specifically because it is a [deterministic finite
+automaton](https://en.wikipedia.org/wiki/Deterministic_finite_automaton) in
+an attempt to make some kinds of [denial of service
+attacks](https://owasp.org/www-community/attacks/Regular_expression_Denial_of_Service_-_ReDoS)
+not possible.
+
+The new URL can be specified using a
 simple text substitution syntax, or use Lua scripts; Lua scripts will
 contain the same metamethods available in the `req` metatable provided by
 the Lua module, so it can be quite powerful.
@@ -695,9 +716,8 @@ Without keep-alive, these numbers drop around 6-fold.
 IRC Channel
 -----------
 
-There is an IRC channel (`#lwan`) on [Freenode](http://freenode.net). A
-standard IRC client can be used.  A [web IRC gateway](http://webchat.freenode.net?channels=%23lwan&uio=d4)
-is also available.
+There is an IRC channel (`#lwan`) on [Libera](https://libera.chat). A
+standard IRC client can be used.
 
 Lwan in the wild
 ----------------

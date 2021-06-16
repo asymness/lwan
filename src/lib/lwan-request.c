@@ -33,6 +33,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include "lwan-private.h"
@@ -44,48 +45,14 @@
 #include "lwan-io-wrappers.h"
 #include "sha1.h"
 
+#define HEADER_VALUE_SEPARATOR_LEN (sizeof(": ") - 1)
 #define HEADER_TERMINATOR_LEN (sizeof("\r\n") - 1)
 #define MIN_REQUEST_SIZE (sizeof("GET / HTTP/1.1\r\n\r\n") - 1)
-#define N_HEADER_START 64
 
 enum lwan_read_finalizer {
     FINALIZER_DONE,
     FINALIZER_TRY_AGAIN,
-    FINALIZER_ERROR_TIMEOUT
-};
-
-struct lwan_request_parser_helper {
-    struct lwan_value *buffer;		/* The whole request buffer */
-    char *next_request;			/* For pipelined requests */
-
-    char **header_start;		/* Headers: n: start, n+1: end */
-    size_t n_header_start;		/* len(header_start) */
-
-    struct lwan_value accept_encoding;	/* Accept-Encoding: */
-
-    struct lwan_value query_string;	/* Stuff after ? and before # */
-
-    struct lwan_value post_data;	/* Request body for POST */
-    struct lwan_value content_type;	/* Content-Type: for POST */
-    struct lwan_value content_length;	/* Content-Length: */
-
-    struct lwan_value connection;	/* Connection: */
-
-    struct lwan_key_value_array cookies, query_params, post_params;
-
-    struct { /* If-Modified-Since: */
-        struct lwan_value raw;
-        time_t parsed;
-    } if_modified_since;
-
-    struct { /* Range: */
-        struct lwan_value raw;
-        off_t from, to;
-    } range;
-
-    time_t error_when_time;		/* Time to abort request read */
-    int error_when_n_packets;		/* Max. number of packets */
-    int urls_rewritten;			/* Times URLs have been rewritten */
+    FINALIZER_TIMEOUT,
 };
 
 struct proxy_header_v2 {
@@ -429,7 +396,7 @@ static void parse_query_string(struct lwan_request *request)
                      url_decode, '&');
 }
 
-static void parse_post_data(struct lwan_request *request)
+static void parse_form_data(struct lwan_request *request)
 {
     struct lwan_request_parser_helper *helper = request->helper;
     static const char content_type[] = "application/x-www-form-urlencoded";
@@ -440,7 +407,7 @@ static void parse_post_data(struct lwan_request *request)
                          sizeof(content_type) - 1)))
         return;
 
-    parse_key_values(request, &helper->post_data, &helper->post_params,
+    parse_key_values(request, &helper->body_data, &helper->post_params,
                      url_decode, '&');
 }
 
@@ -553,7 +520,7 @@ static bool parse_headers(struct lwan_request_parser_helper *helper,
             return false;
 
         if (next_chr == next_header) {
-            if (buffer_end - next_chr > (ptrdiff_t)HEADER_TERMINATOR_LEN) {
+            if (buffer_end - next_chr >= (ptrdiff_t)HEADER_TERMINATOR_LEN) {
                 STRING_SWITCH_SMALL (next_header) {
                 case STR2_INT('\r', '\n'):
                     helper->next_request = next_header + HEADER_TERMINATOR_LEN;
@@ -640,6 +607,28 @@ static void parse_if_modified_since(struct lwan_request_parser_helper *helper)
     helper->if_modified_since.parsed = parsed;
 }
 
+static bool
+parse_off_without_sign(const char *ptr, char **end, off_t *off)
+{
+    unsigned long long val;
+
+    static_assert(sizeof(val) >= sizeof(off_t),
+                  "off_t fits in a long long");
+
+    errno = 0;
+
+    val = strtoull(ptr, end, 10);
+    if (UNLIKELY(val == 0 && *end == ptr))
+        return false;
+    if (UNLIKELY(errno != 0))
+        return false;
+    if (UNLIKELY(val > OFF_MAX))
+        return false;
+
+    *off = (off_t)val;
+    return true;
+}
+
 static void
 parse_range(struct lwan_request_parser_helper *helper)
 {
@@ -651,31 +640,39 @@ parse_range(struct lwan_request_parser_helper *helper)
         return;
 
     range += sizeof("bytes=") - 1;
-    uint64_t from, to;
 
-    if (sscanf(range, "%"SCNu64"-%"SCNu64, &from, &to) == 2) {
-        if (UNLIKELY(from > OFF_MAX || to > OFF_MAX))
+    off_t from, to;
+    char *end;
+
+    if (*range == '-') {
+        from = 0;
+
+        if (!parse_off_without_sign(range + 1, &end, &to))
+            goto invalid_range;
+        if (*end != '\0')
+            goto invalid_range;
+    } else if (lwan_char_isdigit(*range)) {
+        if (!parse_off_without_sign(range, &end, &from))
+            goto invalid_range;
+        if (*end != '-')
             goto invalid_range;
 
-        helper->range.from = (off_t)from;
-        helper->range.to = (off_t)to;
-    } else if (sscanf(range, "-%"SCNu64, &to) == 1) {
-        if (UNLIKELY(to > OFF_MAX))
-            goto invalid_range;
-
-        helper->range.from = 0;
-        helper->range.to = (off_t)to;
-    } else if (sscanf(range, "%"SCNu64"-", &from) == 1) {
-        if (UNLIKELY(from > OFF_MAX))
-            goto invalid_range;
-
-        helper->range.from = (off_t)from;
-        helper->range.to = -1;
+        range = end + 1;
+        if (*range == '\0') {
+            to = -1;
+        } else {
+            if (!parse_off_without_sign(range, &end, &to))
+                goto invalid_range;
+            if (*end != '\0')
+                goto invalid_range;
+        }
     } else {
 invalid_range:
-        helper->range.from = -1;
-        helper->range.to = -1;
+        to = from = -1;
     }
+
+    helper->range.from = from;
+    helper->range.to = to;
 }
 
 static void
@@ -761,15 +758,18 @@ out:
     if (LIKELY(!(request->flags & REQUEST_IS_HTTP_1_0)))
         has_keep_alive = !has_close;
 
-    if (has_keep_alive)
+    if (has_keep_alive) {
         request->conn->flags |= CONN_IS_KEEP_ALIVE;
-    else
-        request->conn->flags &= ~CONN_IS_KEEP_ALIVE;
+    } else {
+        request->conn->flags &=
+            ~(CONN_IS_KEEP_ALIVE | CONN_SENT_CONNECTION_HEADER);
+    }
 }
 
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
 static void save_to_corpus_for_fuzzing(struct lwan_value buffer)
 {
+    struct lwan_value buffer_copy;
     char corpus_name[PATH_MAX];
     const char *crlfcrlf;
     int fd;
@@ -779,14 +779,16 @@ static void save_to_corpus_for_fuzzing(struct lwan_value buffer)
     buffer.len = (size_t)(crlfcrlf - buffer.value + 4);
 
 try_another_file_name:
+    buffer_copy = buffer;
+
     snprintf(corpus_name, sizeof(corpus_name), "corpus-request-%d", rand());
 
     fd = open(corpus_name, O_WRONLY | O_CLOEXEC | O_CREAT | O_EXCL, 0644);
     if (fd < 0)
         goto try_another_file_name;
 
-    for (ssize_t total_written = 0; total_written != (ssize_t)buffer.len;) {
-        ssize_t r = write(fd, buffer.value, buffer.len);
+    while (buffer_copy.len) {
+        ssize_t r = write(fd, buffer_copy.value, buffer_copy.len);
 
         if (r < 0) {
             if (errno == EAGAIN || errno == EINTR)
@@ -797,7 +799,8 @@ try_another_file_name:
             goto try_another_file_name;
         }
 
-        total_written += r;
+        buffer_copy.value += r;
+        buffer_copy.len -= r;
     }
 
     close(fd);
@@ -806,17 +809,15 @@ try_another_file_name:
 #endif
 
 static enum lwan_http_status
-read_from_request_socket(struct lwan_request *request,
-                         struct lwan_value *buffer,
-                         const size_t buffer_size,
-                         enum lwan_read_finalizer (*finalizer)(
-                             size_t total_read,
-                             size_t buffer_size,
-                             struct lwan_request *request,
-                             int n_packets))
+client_read(struct lwan_request *request,
+            struct lwan_value *buffer,
+            const size_t want_to_read,
+            enum lwan_read_finalizer (*finalizer)(const struct lwan_value *buffer,
+                                                  size_t want_to_read,
+                                                  const struct lwan_request *request,
+                                                  int n_packets))
 {
     struct lwan_request_parser_helper *helper = request->helper;
-    size_t total_read = 0;
     int n_packets = 0;
 
     if (helper->next_request) {
@@ -825,38 +826,36 @@ read_from_request_socket(struct lwan_request *request,
 
         if (__builtin_sub_overflow(buffer->len, next_request_len, &new_len)) {
             helper->next_request = NULL;
-        } else {
+        } else if (new_len) {
             /* FIXME: This memmove() could be eventually removed if a better
              * stucture (maybe a ringbuffer, reading with readv(), and each
              * pointer is coro_strdup() if they wrap around?) were used for
              * the request buffer.  */
-            total_read = buffer->len = new_len;
+            buffer->len = new_len;
             memmove(buffer->value, helper->next_request, new_len);
             goto try_to_finalize;
         }
     }
 
-    for (;; n_packets++) {
-        size_t to_read = (size_t)(buffer_size - total_read);
+    for (buffer->len = 0;; n_packets++) {
+        size_t to_read = (size_t)(want_to_read - buffer->len);
 
         if (UNLIKELY(to_read == 0))
             return HTTP_TOO_LARGE;
 
-        ssize_t n = read(request->fd, buffer->value + total_read, to_read);
+        ssize_t n = recv(request->fd, buffer->value + buffer->len, to_read, 0);
         if (UNLIKELY(n <= 0)) {
             if (n < 0) {
                 switch (errno) {
+                case EINTR:
                 case EAGAIN:
 yield_and_read_again:
                     coro_yield(request->conn->coro, CONN_CORO_WANT_READ);
                     continue;
-                case EINTR:
-                    coro_yield(request->conn->coro, CONN_CORO_YIELD);
-                    continue;
                 }
 
                 /* Unexpected error before reading anything */
-                if (UNLIKELY(!total_read))
+                if (UNLIKELY(!buffer->len))
                     return HTTP_BAD_REQUEST;
             }
 
@@ -865,24 +864,21 @@ yield_and_read_again:
             break;
         }
 
-        total_read += (size_t)n;
-        buffer->len = (size_t)total_read;
+        buffer->len += (size_t)n;
 
 try_to_finalize:
-        switch (finalizer(total_read, buffer_size, request, n_packets)) {
+        switch (finalizer(buffer, want_to_read, request, n_packets)) {
         case FINALIZER_DONE:
             buffer->value[buffer->len] = '\0';
-
 #if defined(FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION)
             save_to_corpus_for_fuzzing(*buffer);
 #endif
-
             return HTTP_OK;
 
         case FINALIZER_TRY_AGAIN:
             goto yield_and_read_again;
 
-        case FINALIZER_ERROR_TIMEOUT:
+        case FINALIZER_TIMEOUT:
             return HTTP_TIMEOUT;
         }
     }
@@ -893,39 +889,34 @@ try_to_finalize:
 }
 
 static enum lwan_read_finalizer
-read_request_finalizer(size_t total_read,
-                       size_t buffer_size __attribute__((unused)),
-                       struct lwan_request *request,
+read_request_finalizer(const struct lwan_value *buffer,
+                       size_t want_to_read __attribute__((unused)),
+                       const struct lwan_request *request,
                        int n_packets)
 {
     static const size_t min_proxied_request_size =
         MIN_REQUEST_SIZE + sizeof(struct proxy_header_v2);
     struct lwan_request_parser_helper *helper = request->helper;
 
-    /* Yield a timeout error to avoid clients being intentionally slow and
-     * hogging the server.  (Clients can't only connect and do nothing, they
-     * need to send data, otherwise the timeout queue timer will kick in and
-     * close the connection.  Limit the number of packets to avoid them sending
-     * just a byte at a time.) See calculate_n_packets() to see how this is
-     * calculated. */
-    if (UNLIKELY(n_packets > helper->error_when_n_packets))
-        return FINALIZER_ERROR_TIMEOUT;
+    if (LIKELY(buffer->len >= MIN_REQUEST_SIZE)) {
+        STRING_SWITCH (buffer->value + buffer->len - 4) {
+        case STR4_INT('\r', '\n', '\r', '\n'):
+            return FINALIZER_DONE;
+        }
+    }
 
-    char *crlfcrlf =
-        memmem(helper->buffer->value, helper->buffer->len, "\r\n\r\n", 4);
+    char *crlfcrlf = memmem(buffer->value, buffer->len, "\r\n\r\n", 4);
     if (LIKELY(crlfcrlf)) {
-        const size_t crlfcrlf_to_base =
-            (size_t)(crlfcrlf - helper->buffer->value);
-
         if (LIKELY(helper->next_request)) {
             helper->next_request = NULL;
             return FINALIZER_DONE;
         }
 
+        const size_t crlfcrlf_to_base = (size_t)(crlfcrlf - buffer->value);
         if (crlfcrlf_to_base >= MIN_REQUEST_SIZE - 4)
             return FINALIZER_DONE;
 
-        if (total_read > min_proxied_request_size &&
+        if (buffer->len > min_proxied_request_size &&
             request->flags & REQUEST_ALLOW_PROXY_REQS) {
             /* FIXME: Checking for PROXYv2 protocol header here is a layering
              * violation. */
@@ -936,47 +927,49 @@ read_request_finalizer(size_t total_read,
         }
     }
 
+    /* Yield a timeout error to avoid clients being intentionally slow and
+     * hogging the server.  (Clients can't only connect and do nothing, they
+     * need to send data, otherwise the timeout queue timer will kick in and
+     * close the connection.  Limit the number of packets to avoid them sending
+     * just a byte at a time.) See lwan_calculate_n_packets() to see how this is
+     * calculated. */
+    if (UNLIKELY(n_packets > helper->error_when_n_packets))
+        return FINALIZER_TIMEOUT;
+
     return FINALIZER_TRY_AGAIN;
 }
 
 static ALWAYS_INLINE enum lwan_http_status
 read_request(struct lwan_request *request)
 {
-    return read_from_request_socket(request, request->helper->buffer,
-                                    DEFAULT_BUFFER_SIZE - 1 /* -1 for NUL byte */,
-                                    read_request_finalizer);
+    return client_read(request, request->helper->buffer,
+                       DEFAULT_BUFFER_SIZE - 1 /* -1 for NUL byte */,
+                       read_request_finalizer);
 }
 
 static enum lwan_read_finalizer
-post_data_finalizer(size_t total_read,
-                    size_t buffer_size,
-                    struct lwan_request *request,
+body_data_finalizer(const struct lwan_value *buffer,
+                    size_t want_to_read,
+                    const struct lwan_request *request,
                     int n_packets)
 {
-    struct lwan_request_parser_helper *helper = request->helper;
+    const struct lwan_request_parser_helper *helper = request->helper;
 
-    if (buffer_size == total_read)
+    if (want_to_read == buffer->len)
         return FINALIZER_DONE;
 
     /* For POST requests, the body can be larger, and due to small MTUs on
      * most ethernet connections, responding with a timeout solely based on
      * number of packets doesn't work.  Use keepalive timeout instead.  */
     if (UNLIKELY(time(NULL) > helper->error_when_time))
-        return FINALIZER_ERROR_TIMEOUT;
+        return FINALIZER_TIMEOUT;
 
     /* In addition to time, also estimate the number of packets based on an
      * usual MTU value and the request body size.  */
     if (UNLIKELY(n_packets > helper->error_when_n_packets))
-        return FINALIZER_ERROR_TIMEOUT;
+        return FINALIZER_TIMEOUT;
 
     return FINALIZER_TRY_AGAIN;
-}
-
-static ALWAYS_INLINE int calculate_n_packets(size_t total)
-{
-    /* 740 = 1480 (a common MTU) / 2, so that Lwan'll optimistically error out
-     * after ~2x number of expected packets to fully read the request body.*/
-    return LWAN_MAX(5, (int)(total / 740));
 }
 
 static const char *is_dir(const char *v)
@@ -1005,33 +998,54 @@ static const char *is_dir(const char *v)
     return v;
 }
 
+static const char *is_dir_good_for_tmp(const char *v)
+{
+    struct statfs sb;
+
+    v = is_dir(v);
+    if (!v)
+        return NULL;
+
+    if (!statfs(v, &sb) && sb.f_type == TMPFS_MAGIC) {
+        lwan_status_warning("%s is a tmpfs filesystem, "
+                            "not considering it", v);
+        return NULL;
+    }
+
+    return v;
+}
+
 static const char *temp_dir;
+static const size_t body_buffer_temp_file_thresh = 1<<20;
 
 static const char *
 get_temp_dir(void)
 {
     const char *tmpdir;
 
-    tmpdir = is_dir(secure_getenv("TMPDIR"));
+    tmpdir = is_dir_good_for_tmp(secure_getenv("TMPDIR"));
     if (tmpdir)
         return tmpdir;
 
-    tmpdir = is_dir(secure_getenv("TMP"));
+    tmpdir = is_dir_good_for_tmp(secure_getenv("TMP"));
     if (tmpdir)
         return tmpdir;
 
-    tmpdir = is_dir(secure_getenv("TEMP"));
+    tmpdir = is_dir_good_for_tmp(secure_getenv("TEMP"));
     if (tmpdir)
         return tmpdir;
 
-    tmpdir = is_dir("/var/tmp");
+    tmpdir = is_dir_good_for_tmp("/var/tmp");
     if (tmpdir)
         return tmpdir;
 
-    tmpdir = is_dir(P_tmpdir);
+    tmpdir = is_dir_good_for_tmp(P_tmpdir);
     if (tmpdir)
         return tmpdir;
 
+    lwan_status_warning("Temporary directory could not be determined. POST "
+                        "or PUT requests over %zu bytes bytes will fail.",
+                        body_buffer_temp_file_thresh);
     return NULL;
 }
 
@@ -1078,7 +1092,7 @@ struct file_backed_buffer {
 };
 
 static void
-free_post_buffer(void *data)
+free_body_buffer(void *data)
 {
     struct file_backed_buffer *buf = data;
 
@@ -1087,13 +1101,13 @@ free_post_buffer(void *data)
 }
 
 static void*
-alloc_post_buffer(struct coro *coro, size_t size, bool allow_file)
+alloc_body_buffer(struct coro *coro, size_t size, bool allow_file)
 {
     struct file_backed_buffer *buf;
     void *ptr = (void *)MAP_FAILED;
     int fd;
 
-    if (LIKELY(size < 1<<20)) {
+    if (LIKELY(size < body_buffer_temp_file_thresh)) {
         ptr = coro_malloc(coro, size);
 
         if (LIKELY(ptr))
@@ -1122,7 +1136,7 @@ alloc_post_buffer(struct coro *coro, size_t size, bool allow_file)
     if (UNLIKELY(ptr == MAP_FAILED))
         return NULL;
 
-    buf = coro_malloc_full(coro, sizeof(*buf), free_post_buffer);
+    buf = coro_malloc_full(coro, sizeof(*buf), free_body_buffer);
     if (UNLIKELY(!buf)) {
         munmap(ptr, size);
         return NULL;
@@ -1133,59 +1147,98 @@ alloc_post_buffer(struct coro *coro, size_t size, bool allow_file)
     return ptr;
 }
 
-static enum lwan_http_status read_post_data(struct lwan_request *request)
+static enum lwan_http_status
+get_remaining_body_data_length(struct lwan_request *request,
+                               const size_t max_size,
+                               size_t *total,
+                               size_t *have)
 {
     struct lwan_request_parser_helper *helper = request->helper;
-    /* Holy indirection, Batman! */
-    struct lwan_config *config = &request->conn->thread->lwan->config;
-    const size_t max_post_data_size = config->max_post_data_size;
-    char *new_buffer;
-    long parsed_size;
+    long long parsed_size;
 
     if (UNLIKELY(!helper->content_length.value))
         return HTTP_BAD_REQUEST;
-    parsed_size = parse_long(helper->content_length.value, -1);
+
+    parsed_size = parse_long_long(helper->content_length.value, -1);
     if (UNLIKELY(parsed_size < 0))
         return HTTP_BAD_REQUEST;
-    if (UNLIKELY(parsed_size >= (long)max_post_data_size))
+    if (UNLIKELY((size_t)parsed_size >= max_size))
         return HTTP_TOO_LARGE;
+    if (UNLIKELY(!parsed_size))
+        return HTTP_OK;
 
-    size_t post_data_size = (size_t)parsed_size;
-    size_t have;
+    *total = (size_t)parsed_size;
+
     if (!helper->next_request) {
-        have = 0;
-    } else {
-        char *buffer_end = helper->buffer->value + helper->buffer->len;
-        have = (size_t)(ptrdiff_t)(buffer_end - helper->next_request);
+        *have = 0;
+        return HTTP_PARTIAL_CONTENT;
+    }
 
-        if (have >= post_data_size) {
-            helper->post_data.value = helper->next_request;
-            helper->post_data.len = post_data_size;
-            helper->next_request += post_data_size;
-            return HTTP_OK;
+    char *buffer_end = helper->buffer->value + helper->buffer->len;
+
+    *have = (size_t)(buffer_end - helper->next_request);
+
+    if (*have < *total)
+        return HTTP_PARTIAL_CONTENT;
+
+    helper->body_data.value = helper->next_request;
+    helper->body_data.len = *total;
+    helper->next_request += *total;
+    return HTTP_OK;
+}
+
+static int read_body_data(struct lwan_request *request)
+{
+    /* Holy indirection, Batman! */
+    const struct lwan_config *config = &request->conn->thread->lwan->config;
+    struct lwan_request_parser_helper *helper = request->helper;
+    enum lwan_http_status status;
+    size_t total, have, max_data_size;
+    bool allow_temp_file;
+    char *new_buffer;
+
+    if (lwan_request_get_method(request) == REQUEST_METHOD_POST) {
+        allow_temp_file = config->allow_post_temp_file;
+        max_data_size = config->max_post_data_size;
+    } else {
+        allow_temp_file = config->allow_put_temp_file;
+        max_data_size = config->max_put_data_size;
+    }
+
+    status =
+        get_remaining_body_data_length(request, max_data_size, &total, &have);
+    if (status != HTTP_PARTIAL_CONTENT)
+        return -(int)status;
+
+    if (!(request->flags & REQUEST_IS_HTTP_1_0)) {
+        /* §8.2.3 https://www.w3.org/Protocols/rfc2616/rfc2616-sec8.html */
+        const char *expect = lwan_request_get_header(request, "Expect");
+
+        if (expect && strncmp(expect, "100-", 4) == 0) {
+            static const char continue_header[] = "HTTP/1.1 100 Continue\r\n\r\n";
+
+            lwan_send(request, continue_header, sizeof(continue_header) - 1, 0);
         }
     }
 
-    new_buffer = alloc_post_buffer(request->conn->coro, post_data_size + 1,
-                                   config->allow_post_temp_file);
+    new_buffer =
+        alloc_body_buffer(request->conn->coro, total + 1, allow_temp_file);
     if (UNLIKELY(!new_buffer))
-        return HTTP_INTERNAL_ERROR;
+        return -HTTP_INTERNAL_ERROR;
 
-    helper->post_data.value = new_buffer;
-    helper->post_data.len = post_data_size;
+    helper->body_data.value = new_buffer;
+    helper->body_data.len = total;
     if (have) {
         new_buffer = mempcpy(new_buffer, helper->next_request, have);
-        post_data_size -= have;
+        total -= have;
     }
     helper->next_request = NULL;
 
     helper->error_when_time = time(NULL) + config->keep_alive_timeout;
-    helper->error_when_n_packets = calculate_n_packets(post_data_size);
+    helper->error_when_n_packets = lwan_calculate_n_packets(total);
 
-    struct lwan_value buffer = {.value = new_buffer,
-                                .len = post_data_size};
-    return read_from_request_socket(request, &buffer, buffer.len,
-                                    post_data_finalizer);
+    struct lwan_value buffer = {.value = new_buffer, .len = total};
+    return (int)client_read(request, &buffer, total, body_data_finalizer);
 }
 
 static char *
@@ -1263,7 +1316,10 @@ prepare_websocket_handshake(struct lwan_request *request, char **encoded)
         lwan_request_get_header(request, "Sec-WebSocket-Key");
     if (UNLIKELY(!sec_websocket_key))
         return HTTP_BAD_REQUEST;
+
     const size_t sec_websocket_key_len = strlen(sec_websocket_key);
+    if (base64_encoded_len(16) != sec_websocket_key_len)
+        return HTTP_BAD_REQUEST;
     if (UNLIKELY(!base64_validate((void *)sec_websocket_key, sec_websocket_key_len)))
         return HTTP_BAD_REQUEST;
 
@@ -1273,11 +1329,7 @@ prepare_websocket_handshake(struct lwan_request *request, char **encoded)
     sha1_finalize(&ctx, digest);
 
     *encoded = (char *)base64_encode(digest, sizeof(digest), NULL);
-    if (UNLIKELY(!*encoded))
-        return HTTP_INTERNAL_ERROR;
-    coro_defer(request->conn->coro, free, *encoded);
-
-    return HTTP_SWITCHING_PROTOCOLS;
+    return LIKELY(*encoded) ? HTTP_SWITCHING_PROTOCOLS : HTTP_INTERNAL_ERROR;
 }
 
 enum lwan_http_status
@@ -1300,48 +1352,66 @@ lwan_request_websocket_upgrade(struct lwan_request *request)
             {.key = "Upgrade", .value = "websocket"},
             {},
         });
+    free(encoded);
     if (UNLIKELY(!header_buf_len))
         return HTTP_INTERNAL_ERROR;
 
     request->conn->flags |= CONN_IS_WEBSOCKET;
     lwan_send(request, header_buf, header_buf_len, 0);
-    coro_yield(request->conn->coro, CONN_CORO_WANT_READ_WRITE);
 
     return HTTP_SWITCHING_PROTOCOLS;
 }
 
-static enum lwan_http_status prepare_for_response(struct lwan_url_map *url_map,
+static inline bool request_has_body(const struct lwan_request *request)
+{
+    /* 3rd bit set in method: request method has body. See lwan.h,
+     * definition of FOR_EACH_REQUEST_METHOD() for more info. */
+    return lwan_request_get_method(request) & 1 << 3;
+}
+
+static enum lwan_http_status
+maybe_read_body_data(const struct lwan_url_map *url_map,
+                     struct lwan_request *request)
+{
+    int status = 0;
+
+    if (url_map->flags & HANDLER_EXPECTS_BODY_DATA) {
+        status = read_body_data(request);
+        if (status > 0)
+            return (enum lwan_http_status)status;
+    }
+
+    /* Instead of trying to read the body here, which will require
+     * us to allocate and read potentially a lot of bytes, force
+     * this connection to be closed as soon as we send a "not allowed"
+     * response.  */
+    request->conn->flags &= ~CONN_IS_KEEP_ALIVE;
+
+    if (status < 0) {
+        status = -status;
+        return (enum lwan_http_status)status;
+    }
+
+    return HTTP_NOT_ALLOWED;
+}
+
+static enum lwan_http_status prepare_for_response(const struct lwan_url_map *url_map,
                                                   struct lwan_request *request)
 {
     request->url.value += url_map->prefix_len;
     request->url.len -= url_map->prefix_len;
-
-    if (UNLIKELY(url_map->flags & HANDLER_MUST_AUTHORIZE &&
-                 !lwan_http_authorize(request, url_map->authorization.realm,
-                                      url_map->authorization.password_file)))
-        return HTTP_NOT_AUTHORIZED;
-
     while (*request->url.value == '/' && request->url.len > 0) {
         request->url.value++;
         request->url.len--;
     }
 
-    if (lwan_request_get_method(request) == REQUEST_METHOD_POST) {
-        enum lwan_http_status status;
-
-        if (!(url_map->flags & HANDLER_HAS_POST_DATA)) {
-            /* FIXME: Discard POST data here? If a POST request is sent
-             * to a handler that is not supposed to handle a POST request,
-             * the next request in the pipeline will fail because the
-             * body of the previous request will be used as the next
-             * request itself. */
-            return HTTP_NOT_ALLOWED;
-        }
-
-        status = read_post_data(request);
-        if (UNLIKELY(status != HTTP_OK))
-            return status;
+    if (UNLIKELY(url_map->flags & HANDLER_MUST_AUTHORIZE)) {
+        if (!lwan_http_authorize_urlmap(request, url_map))
+            return HTTP_NOT_AUTHORIZED;
     }
+
+    if (UNLIKELY(request_has_body(request)))
+        return maybe_read_body_data(url_map, request);
 
     return HTTP_OK;
 }
@@ -1363,70 +1433,119 @@ static bool handle_rewrite(struct lwan_request *request)
     return true;
 }
 
-char *lwan_process_request(struct lwan *l,
-                           struct lwan_request *request,
-                           struct lwan_value *buffer,
-                           char *next_request)
+#ifndef NDEBUG
+static const char *get_request_method(struct lwan_request *request)
 {
-    char *header_start[N_HEADER_START];
-    struct lwan_request_parser_helper helper = {
-        .buffer = buffer,
-        .next_request = next_request,
-        .error_when_n_packets = calculate_n_packets(DEFAULT_BUFFER_SIZE),
-        .header_start = header_start,
+#define GENERATE_CASE_STMT(upper, lower, mask, constant)                       \
+    case REQUEST_METHOD_##upper:                                               \
+        return #upper;
+
+    switch (lwan_request_get_method(request)) {
+        FOR_EACH_REQUEST_METHOD(GENERATE_CASE_STMT)
+    default:
+        return "UNKNOWN";
+    }
+
+#undef GENERATE_CASE_STMT
+}
+
+static void log_request(struct lwan_request *request,
+                        enum lwan_http_status status,
+                        double duration)
+{
+    char ip_buffer[INET6_ADDRSTRLEN];
+
+    lwan_status_debug("%s [%s] %016lx \"%s %s HTTP/%s\" %d %s %.3f ms",
+                      lwan_request_get_remote_address(request, ip_buffer),
+                      request->conn->thread->date.date, request->request_id,
+                      get_request_method(request), request->original_url.value,
+                      request->flags & REQUEST_IS_HTTP_1_0 ? "1.0" : "1.1",
+                      status, request->response.mime_type, duration);
+}
+#else
+#define log_request(...)
+#endif
+
+#ifndef NDEBUG
+static struct timespec current_precise_monotonic_timespec(void)
+{
+    struct timespec now;
+
+    if (UNLIKELY(clock_gettime(CLOCK_MONOTONIC, &now) < 0)) {
+        lwan_status_perror("clock_gettime");
+        return (struct timespec){};
+    }
+
+    return now;
+}
+
+static double elapsed_time_ms(const struct timespec then)
+{
+    const struct timespec now = current_precise_monotonic_timespec();
+    struct timespec diff = {
+        .tv_sec = now.tv_sec - then.tv_sec,
+        .tv_nsec = now.tv_nsec - then.tv_nsec,
     };
+
+    if (diff.tv_nsec < 0) {
+        diff.tv_sec--;
+        diff.tv_nsec += 1000000000l;
+    }
+
+    return (double)diff.tv_sec / 1000.0 + (double)diff.tv_nsec / 1000000.0;
+}
+#endif
+
+void lwan_process_request(struct lwan *l, struct lwan_request *request)
+{
     enum lwan_http_status status;
     struct lwan_url_map *url_map;
 
-    request->helper = &helper;
-
     status = read_request(request);
-    if (UNLIKELY(status != HTTP_OK)) {
-        /* This request was bad, but maybe there's a good one in the
-         * pipeline.  */
-        if (status == HTTP_BAD_REQUEST && helper.next_request)
-            goto out;
 
-        /* Response here can be: HTTP_TOO_LARGE, HTTP_BAD_REQUEST (without
-         * next request), or HTTP_TIMEOUT.  Nothing to do, just abort the
-         * coroutine.  */
+#ifndef NDEBUG
+    struct timespec request_begin_time = current_precise_monotonic_timespec();
+#endif
+    if (UNLIKELY(status != HTTP_OK)) {
+        /* If read_request() returns any error at this point, it's probably
+         * better to just send an error response and abort the coroutine and
+         * let the client handle the error instead: we don't have
+         * information to even log the request because it has not been
+         * parsed yet at this stage.  Even if there are other requests waiting
+         * in the pipeline, this seems like the safer thing to do.  */
         lwan_default_response(request, status);
         coro_yield(request->conn->coro, CONN_CORO_ABORT);
         __builtin_unreachable();
     }
 
     status = parse_http_request(request);
-    if (UNLIKELY(status != HTTP_OK)) {
-        lwan_default_response(request, status);
-        goto out;
-    }
+    if (UNLIKELY(status != HTTP_OK))
+        goto log_and_return;
 
 lookup_again:
     url_map = lwan_trie_lookup_prefix(&l->url_map_trie, request->url.value);
     if (UNLIKELY(!url_map)) {
-        lwan_default_response(request, HTTP_NOT_FOUND);
-        goto out;
+        status = HTTP_NOT_FOUND;
+        goto log_and_return;
     }
 
     status = prepare_for_response(url_map, request);
-    if (UNLIKELY(status != HTTP_OK)) {
-        lwan_default_response(request, status);
-        goto out;
-    }
+    if (UNLIKELY(status != HTTP_OK))
+        goto log_and_return;
 
     status = url_map->handler(request, &request->response, url_map->data);
     if (UNLIKELY(url_map->flags & HANDLER_CAN_REWRITE_URL)) {
         if (request->flags & RESPONSE_URL_REWRITTEN) {
             if (LIKELY(handle_rewrite(request)))
                 goto lookup_again;
-            goto out;
+            return;
         }
     }
 
+log_and_return:
     lwan_response(request, status);
 
-out:
-    return helper.next_request;
+    log_request(request, status, elapsed_time_ms(request_begin_time));
 }
 
 static inline void *
@@ -1467,25 +1586,24 @@ const char *lwan_request_get_cookie(struct lwan_request *request,
 const char *lwan_request_get_header(struct lwan_request *request,
                                     const char *header)
 {
-    char name[64];
-    int r;
+    const size_t header_len = strlen(header);
+    const size_t header_len_with_separator = header_len + HEADER_VALUE_SEPARATOR_LEN;
 
     assert(strchr(header, ':') == NULL);
-
-    r = snprintf(name, sizeof(name), "%s: ", header);
-    if (UNLIKELY(r < 0 || r >= (int)sizeof(name)))
-        return NULL;
 
     for (size_t i = 0; i < request->helper->n_header_start; i++) {
         const char *start = request->helper->header_start[i];
         char *end = request->helper->header_start[i + 1] - HEADER_TERMINATOR_LEN;
 
-        if (UNLIKELY(end - start < r))
+        if (UNLIKELY((size_t)(end - start) < header_len_with_separator))
             continue;
 
-        if (!strncasecmp(start, name, (size_t)r)) {
+        if (strncmp(start + header_len, ": ", HEADER_VALUE_SEPARATOR_LEN))
+            continue;
+
+        if (!strncasecmp(start, header, header_len)) {
             *end = '\0';
-            return start + r;
+            return start + header_len_with_separator;
         }
     }
 
@@ -1495,7 +1613,7 @@ const char *lwan_request_get_header(struct lwan_request *request,
 ALWAYS_INLINE int
 lwan_connection_get_fd(const struct lwan *lwan, const struct lwan_connection *conn)
 {
-    return (int)(ptrdiff_t)(conn - lwan->conns);
+    return (int)(intptr_t)(conn - lwan->conns);
 }
 
 const char *
@@ -1538,12 +1656,14 @@ lwan_request_get_remote_address(struct lwan_request *request,
 
 static void remove_sleep(void *data1, void *data2)
 {
+    static const enum lwan_connection_flags suspended_sleep =
+        CONN_SUSPENDED | CONN_HAS_REMOVE_SLEEP_DEFER;
     struct timeouts *wheel = data1;
     struct timeout *timeout = data2;
     struct lwan_request *request =
         container_of(timeout, struct lwan_request, timeout);
 
-    if (request->conn->flags & CONN_SUSPENDED_TIMER)
+    if ((request->conn->flags & suspended_sleep) == suspended_sleep)
         timeouts_del(wheel, timeout);
 
     request->conn->flags &= ~CONN_HAS_REMOVE_SLEEP_DEFER;
@@ -1553,6 +1673,15 @@ void lwan_request_sleep(struct lwan_request *request, uint64_t ms)
 {
     struct lwan_connection *conn = request->conn;
     struct timeouts *wheel = conn->thread->wheel;
+    struct timespec now;
+
+    /* We need to update the timer wheel right now because
+     * a request might have requested to sleep a long time
+     * before it was being serviced -- causing the timeout
+     * to essentially be a no-op. */
+    if (UNLIKELY(clock_gettime(monotonic_clock_id, &now) < 0))
+        lwan_status_critical("Could not get monotonic time");
+    timeouts_update(wheel, (timeout_t)(now.tv_sec * 1000 + now.tv_nsec / 1000000));
 
     request->timeout = (struct timeout) {};
     timeouts_add(wheel, &request->timeout, ms);
@@ -1562,7 +1691,7 @@ void lwan_request_sleep(struct lwan_request *request, uint64_t ms)
         conn->flags |= CONN_HAS_REMOVE_SLEEP_DEFER;
     }
 
-    coro_yield(conn->coro, CONN_CORO_SUSPEND_TIMER);
+    coro_yield(conn->coro, CONN_CORO_SUSPEND);
 }
 
 ALWAYS_INLINE int
@@ -1605,7 +1734,7 @@ lwan_request_get_if_modified_since(struct lwan_request *request, time_t *value)
 ALWAYS_INLINE const struct lwan_value *
 lwan_request_get_request_body(struct lwan_request *request)
 {
-    return &request->helper->post_data;
+    return &request->helper->body_data;
 }
 
 ALWAYS_INLINE const struct lwan_value *
@@ -1639,9 +1768,9 @@ lwan_request_get_query_params(struct lwan_request *request)
 ALWAYS_INLINE const struct lwan_key_value_array *
 lwan_request_get_post_params(struct lwan_request *request)
 {
-    if (!(request->flags & REQUEST_PARSED_POST_DATA)) {
-        parse_post_data(request);
-        request->flags |= REQUEST_PARSED_POST_DATA;
+    if (!(request->flags & REQUEST_PARSED_FORM_DATA)) {
+        parse_form_data(request);
+        request->flags |= REQUEST_PARSED_FORM_DATA;
     }
 
     return &request->helper->post_params;
@@ -1697,54 +1826,64 @@ __attribute__((used)) int fuzz_parse_http_request(const uint8_t *data,
         .flags = REQUEST_ALLOW_PROXY_REQS,
         .proxy = &proxy,
     };
+    struct lwan_value buffer = {
+        .value = data_copy,
+        .len = length,
+    };
 
     /* If the finalizer isn't happy with a request, there's no point in
      * going any further with parsing it. */
-    if (read_request_finalizer(length, sizeof(data_copy), &request, 1) !=
-        FINALIZER_DONE)
+    enum lwan_read_finalizer finalizer =
+        read_request_finalizer(&buffer, sizeof(data_copy), &request, 1);
+    if (finalizer != FINALIZER_DONE)
         return 0;
 
-    /* read_from_request_socket() NUL-terminates the string */
+    /* client_read() NUL-terminates the string */
     data_copy[length - 1] = '\0';
 
-    if (parse_http_request(&request) == HTTP_OK) {
-        off_t trash1;
-        time_t trash2;
-        char *trash3;
-        size_t gen = coro_deferred_get_generation(coro);
+    if (parse_http_request(&request) != HTTP_OK)
+        return 0;
 
-        /* Only pointers were set in helper struct; actually parse them here. */
-        parse_accept_encoding(&request);
+    off_t trash1;
+    time_t trash2;
+    char *trash3;
+    size_t gen = coro_deferred_get_generation(coro);
 
-        /* Requesting these items will force them to be parsed, and also
-         * exercise the lookup function. */
-        LWAN_NO_DISCARD(
-            lwan_request_get_header(&request, "Non-Existing-Header"));
-        LWAN_NO_DISCARD(lwan_request_get_header(
-            &request, "Host")); /* Usually existing short header */
-        LWAN_NO_DISCARD(
-            lwan_request_get_cookie(&request, "Non-Existing-Cookie"));
-        LWAN_NO_DISCARD(
-            lwan_request_get_cookie(&request, "FOO")); /* Set by some tests */
-        LWAN_NO_DISCARD(
-            lwan_request_get_query_param(&request, "Non-Existing-Query-Param"));
-        LWAN_NO_DISCARD(
-            lwan_request_get_post_param(&request, "Non-Existing-Post-Param"));
+    /* Only pointers were set in helper struct; actually parse them here. */
+    parse_accept_encoding(&request);
 
-        lwan_request_get_range(&request, &trash1, &trash1);
-        LWAN_NO_DISCARD(trash1);
+    /* Requesting these items will force them to be parsed, and also
+     * exercise the lookup function. */
+    LWAN_NO_DISCARD(lwan_request_get_header(&request, "Non-Existing-Header"));
 
-        lwan_request_get_if_modified_since(&request, &trash2);
-        LWAN_NO_DISCARD(trash2);
+    /* Usually existing short header */
+    LWAN_NO_DISCARD(lwan_request_get_header(&request, "Host"));
 
+    LWAN_NO_DISCARD(lwan_request_get_cookie(&request, "Non-Existing-Cookie"));
+    /* Set by some tests */
+    LWAN_NO_DISCARD(lwan_request_get_cookie(&request, "FOO"));
+
+    LWAN_NO_DISCARD(
+        lwan_request_get_query_param(&request, "Non-Existing-Query-Param"));
+
+    LWAN_NO_DISCARD(
+        lwan_request_get_post_param(&request, "Non-Existing-Post-Param"));
+
+    lwan_request_get_range(&request, &trash1, &trash1);
+    LWAN_NO_DISCARD(trash1);
+
+    lwan_request_get_if_modified_since(&request, &trash2);
+    LWAN_NO_DISCARD(trash2);
+
+    enum lwan_http_status handshake =
         prepare_websocket_handshake(&request, &trash3);
-        LWAN_NO_DISCARD(trash3);
+    LWAN_NO_DISCARD(trash3);
+    if (handshake == HTTP_SWITCHING_PROTOCOLS)
+        free(trash3);
 
-        LWAN_NO_DISCARD(
-            lwan_http_authorize(&request, "Fuzzy Realm", "/dev/null"));
+    LWAN_NO_DISCARD(lwan_http_authorize(&request, "Fuzzy Realm", "/dev/null"));
 
-        coro_deferred_run(coro, gen);
-    }
+    coro_deferred_run(coro, gen);
 
     return 0;
 }

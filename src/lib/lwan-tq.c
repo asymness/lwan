@@ -26,7 +26,7 @@
 static inline int timeout_queue_node_to_idx(struct timeout_queue *tq,
                                             struct lwan_connection *conn)
 {
-    return (conn == &tq->head) ? -1 : (int)(ptrdiff_t)(conn - tq->conns);
+    return (conn == &tq->head) ? -1 : (int)(intptr_t)(conn - tq->conns);
 }
 
 static inline struct lwan_connection *
@@ -91,9 +91,9 @@ void timeout_queue_expire(struct timeout_queue *tq,
     if (LIKELY(conn->coro)) {
         coro_free(conn->coro);
         conn->coro = NULL;
-
-        close(lwan_connection_get_fd(tq->lwan, conn));
     }
+
+    close(lwan_connection_get_fd(tq->lwan, conn));
 }
 
 void timeout_queue_expire_waiting(struct timeout_queue *tq)

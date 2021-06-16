@@ -199,8 +199,10 @@ asm(".text\n\t"
     "movl   0xc(%eax),%ebp\n\t"  /* EBP */
     "movl   0x1c(%eax),%ecx\n\t" /* ECX */
     "ret\n\t");
+#elif defined(HAVE_LIBUCONTEXT)
+#define coro_swapcontext(cur, oth) libucontext_swapcontext(cur, oth)
 #else
-#define coro_swapcontext(cur, oth) swapcontext(cur, oth)
+#error Unsupported platform.
 #endif
 
 __attribute__((used, visibility("internal")))
@@ -290,16 +292,17 @@ void coro_reset(struct coro *coro, coro_function_t func, void *data)
 
 #define STACK_PTR 6
     coro->context[STACK_PTR] = (uintptr_t)stack;
-#else
-    getcontext(&coro->context);
+#elif defined(HAVE_LIBUCONTEXT)
+    libucontext_getcontext(&coro->context);
 
     coro->context.uc_stack.ss_sp = stack;
     coro->context.uc_stack.ss_size = CORO_STACK_SIZE;
     coro->context.uc_stack.ss_flags = 0;
     coro->context.uc_link = NULL;
 
-    makecontext(&coro->context, (void (*)())coro_entry_point, 3, coro, func,
-                data);
+    libucontext_makecontext(&coro->context, (void (*)())coro_entry_point, 3,
+                            coro, func, data);
+
 #endif
 }
 

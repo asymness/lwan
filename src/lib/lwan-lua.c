@@ -19,6 +19,7 @@
  */
 
 #define _GNU_SOURCE
+#include <errno.h>
 #include <ctype.h>
 #include <lauxlib.h>
 #include <lualib.h>
@@ -92,9 +93,36 @@ static int request_param_getter(lua_State *L,
     return 1;
 }
 
+LWAN_LUA_METHOD(remote_address)
+{
+    struct lwan_request *request = lwan_lua_get_request_from_userdata(L);
+    char ip_buffer[INET6_ADDRSTRLEN];
+    lua_pushstring(L, lwan_request_get_remote_address(request, ip_buffer));
+    return 1;
+}
+
+
 LWAN_LUA_METHOD(header)
 {
     return request_param_getter(L, lwan_request_get_header);
+}
+
+LWAN_LUA_METHOD(path)
+{
+    struct lwan_request *request = lwan_lua_get_request_from_userdata(L);
+    lua_pushlstring(L, request->url.value, request->url.len);
+    return 1;
+}
+
+LWAN_LUA_METHOD(query_string)
+{
+    struct lwan_request *request = lwan_lua_get_request_from_userdata(L);
+    if (request->helper->query_string.len) {
+        lua_pushlstring(L, request->helper->query_string.value, request->helper->query_string.len);
+    } else {
+        lua_pushlstring(L, "", 0);
+    }
+    return 1;
 }
 
 LWAN_LUA_METHOD(query_param)
@@ -110,6 +138,17 @@ LWAN_LUA_METHOD(post_param)
 LWAN_LUA_METHOD(cookie)
 {
     return request_param_getter(L, lwan_request_get_cookie);
+}
+
+LWAN_LUA_METHOD(body)
+{
+    struct lwan_request *request = lwan_lua_get_request_from_userdata(L);
+    if (request->helper->body_data.len) {
+        lua_pushlstring(L, request->helper->body_data.value, request->helper->body_data.len);
+    } else {
+        lua_pushlstring(L, "", 0);
+    }
+    return 1;
 }
 
 LWAN_LUA_METHOD(ws_upgrade)
@@ -137,12 +176,23 @@ LWAN_LUA_METHOD(ws_write)
 LWAN_LUA_METHOD(ws_read)
 {
     struct lwan_request *request = lwan_lua_get_request_from_userdata(L);
+    int r;
 
-    if (lwan_response_websocket_read(request)) {
+    /* FIXME: maybe return a table {status=r, content=buf}? */
+
+    r = lwan_response_websocket_read(request);
+    switch (r) {
+    case 0:
         lua_pushlstring(L, lwan_strbuf_get_buffer(request->response.buffer),
                         lwan_strbuf_get_length(request->response.buffer));
-    } else {
-        lua_pushnil(L);
+        break;
+    case ENOTCONN:
+    case EAGAIN:
+        lua_pushinteger(L, r);
+        break;
+    default:
+        lua_pushinteger(L, ENOMSG);
+        break;
     }
 
     return 1;
@@ -246,6 +296,56 @@ LWAN_LUA_METHOD(sleep)
     return 0;
 }
 
+LWAN_LUA_METHOD(request_id)
+{
+    struct lwan_request *request = lwan_lua_get_request_from_userdata(L);
+    lua_pushfstring(L, "%016lx", request->request_id);
+    return 1;
+}
+
+LWAN_LUA_METHOD(request_date)
+{
+    struct lwan_request *request = lwan_lua_get_request_from_userdata(L);
+    lua_pushstring(L, request->conn->thread->date.date);
+    return 1;
+}
+
+#define IMPLEMENT_LOG_FUNCTION(name)                                           \
+    static int lwan_lua_log_##name(lua_State *L)                               \
+    {                                                                          \
+        size_t log_str_len = 0;                                                \
+        const char *log_str = lua_tolstring(L, -1, &log_str_len);              \
+        if (log_str_len)                                                       \
+            lwan_status_##name("%.*s", (int)log_str_len, log_str);             \
+        return 0;                                                              \
+    }
+
+IMPLEMENT_LOG_FUNCTION(info)
+IMPLEMENT_LOG_FUNCTION(warning)
+IMPLEMENT_LOG_FUNCTION(error)
+IMPLEMENT_LOG_FUNCTION(critical)
+
+#undef IMPLEMENT_LOG_FUNCTION
+
+static int luaopen_log(lua_State *L)
+{
+    static const char *metatable_name = "Lwan.log";
+    static const struct luaL_Reg functions[] = {
+#define LOG_FUNCTION(name) {#name, lwan_lua_log_##name}
+        LOG_FUNCTION(info),
+        LOG_FUNCTION(warning),
+        LOG_FUNCTION(error),
+        LOG_FUNCTION(critical),
+        {},
+#undef LOG_FUNCTION
+    };
+
+    luaL_newmetatable(L, metatable_name);
+    luaL_register(L, metatable_name, functions);
+
+    return 0;
+}
+
 DEFINE_ARRAY_TYPE(lwan_lua_method_array, luaL_reg)
 static struct lwan_lua_method_array lua_methods;
 
@@ -289,6 +389,7 @@ lua_State *lwan_lua_create_state(const char *script_file, const char *script)
         return NULL;
 
     luaL_openlibs(L);
+    luaopen_log(L);
 
     luaL_newmetatable(L, request_metatable_name);
     luaL_register(L, NULL, lwan_lua_method_array_get_array(&lua_methods));
